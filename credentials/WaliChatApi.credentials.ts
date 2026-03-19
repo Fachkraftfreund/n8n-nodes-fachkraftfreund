@@ -34,7 +34,7 @@ export class WaliChatApi implements ICredentialType {
 	test: ICredentialTestRequest = {
 		request: {
 			baseURL: 'https://api.wali.chat/v1',
-			url: '/me/profile',
+			url: '/devices',
 			method: 'GET',
 		},
 	};

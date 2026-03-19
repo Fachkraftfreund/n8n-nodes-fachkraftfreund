@@ -14,7 +14,7 @@ export class WaliChatFirstContacts implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'WaliChat First Contacts',
 		name: 'waliChatFirstContacts',
-		icon: 'fa:user-plus',
+		icon: 'file:walichat.svg',
 		group: ['transform'],
 		version: 1,
 		subtitle: 'Get new chats (first contacts) from the last 24h',
