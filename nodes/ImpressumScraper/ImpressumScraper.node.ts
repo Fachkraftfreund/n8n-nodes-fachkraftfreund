@@ -5,7 +5,6 @@ import {
 	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
-	NodeOperationError,
 } from 'n8n-workflow';
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -322,31 +321,18 @@ export class ImpressumScraper implements INodeType {
 
 		for (const job of jobs) {
 			if (job.error) {
-				if (this.continueOnFail()) {
-					returnData.push({
-						json: { sourceUrl: job.inputUrl, error: job.error, success: false },
-						pairedItem: { item: job.itemIndex },
-					});
-				} else {
-					throw new NodeOperationError(this.getNode(), job.error, {
-						itemIndex: job.itemIndex,
-					});
-				}
+				returnData.push({
+					json: { sourceUrl: job.inputUrl, error: job.error, success: false },
+					pairedItem: { item: job.itemIndex },
+				});
 				continue;
 			}
 
 			if (!job.impressumUrl || !job.impressumHtml) {
-				const msg = `No Impressum page found for ${job.normalizedUrl}`;
-				if (this.continueOnFail()) {
-					returnData.push({
-						json: { sourceUrl: job.inputUrl, error: msg, success: false },
-						pairedItem: { item: job.itemIndex },
-					});
-				} else {
-					throw new NodeOperationError(this.getNode(), msg, {
-						itemIndex: job.itemIndex,
-					});
-				}
+				returnData.push({
+					json: { sourceUrl: job.inputUrl, error: `No Impressum page found for ${job.normalizedUrl}`, success: false },
+					pairedItem: { item: job.itemIndex },
+				});
 				continue;
 			}
 
