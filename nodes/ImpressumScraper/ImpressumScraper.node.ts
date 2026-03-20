@@ -400,15 +400,47 @@ export class ImpressumScraper implements INodeType {
 					job.inputUrl,
 				);
 				successfulJobs.push({ job, data, text });
-			} else if (job.fallbackText && openAiKey) {
-				// Fallback path: no impressum, but we have page text + OpenAI
-				const data = emptyImpressumResult(job.inputUrl);
-				successfulJobs.push({ job, data, text: job.fallbackText });
+			} else if (job.fallbackText) {
+				// Fallback path: no impressum found, try extracting from homepage + fallback pages
+				const html = job.homepageHtml || '';
+				const text = job.fallbackText;
+				const data = extractImpressumData(html, text, job.normalizedUrl, job.inputUrl);
+				successfulJobs.push({ job, data, text });
 			} else {
 				returnData.push({
 					json: { sourceUrl: job.inputUrl, error: `No Impressum page found for ${job.normalizedUrl}`, success: false },
 					pairedItem: { item: job.itemIndex },
 				});
+			}
+		}
+
+		// ── Phase 5b: Fill gaps from homepage HTML ──────────────────
+		for (const { job, data } of successfulJobs) {
+			if (!job.homepageHtml) continue;
+			// Skip if impressum was already the homepage
+			if (job.impressumUrl === job.homepageFinalUrl || job.impressumUrl === job.normalizedUrl) continue;
+
+			// Check if there are null fields worth filling
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const d = data as any;
+			const nullFields = Object.keys(EXTRACTABLE_FIELDS).filter((f) => d[f] === null);
+			if (nullFields.length === 0) continue;
+
+			const homepageText = htmlToText(job.homepageHtml);
+			const homepageData = extractImpressumData(
+				job.homepageHtml,
+				homepageText,
+				job.normalizedUrl,
+				job.inputUrl,
+			);
+
+			// Only fill null fields — never override impressum-extracted values
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const hd = homepageData as any;
+			for (const field of nullFields) {
+				if (hd[field] != null) {
+					d[field] = hd[field];
+				}
 			}
 		}
 
@@ -1029,21 +1061,6 @@ interface ImpressumResult {
 	professionalTitle: string | null;
 	website: string | null;
 	managingDirector: string | null;
-}
-
-function emptyImpressumResult(sourceUrl: string): ImpressumResult {
-	return {
-		sourceUrl,
-		impressumUrl: '',
-		companyName: null, salutation: null, title: null,
-		firstName: null, lastName: null,
-		email: null, phone: null, fax: null, mobile: null,
-		vatId: null, taxNumber: null,
-		street: null, postalCode: null, city: null, country: null,
-		registrationCourt: null, registrationNumber: null,
-		chamber: null, supervisoryAuthority: null, professionalTitle: null,
-		website: null, managingDirector: null,
-	};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
