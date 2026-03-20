@@ -454,6 +454,11 @@ export class ImpressumScraper implements INodeType {
 			await deriveSalutations(this, successfulJobs, openAiKey, openAiModel);
 		}
 
+		// ── Phase 8: Normalize emails ──────────────────────────────
+		for (const { data } of successfulJobs) {
+			if (data.email) data.email = normalizeEmail(data.email);
+		}
+
 		// ── Push final results ──────────────────────────────────────
 		for (const { job, data } of successfulJobs) {
 			returnData.push({
@@ -1430,6 +1435,21 @@ function looksLikePersonName(line: string): boolean {
 	);
 	if (capitalWords.length >= 2 && words.length <= 5) return true;
 	return false;
+}
+
+function normalizeEmail(email: string): string {
+	return email
+		.replace(/\s*\(at\)\s*/gi, '@')
+		.replace(/\s*\[at\]\s*/gi, '@')
+		.replace(/\s*\(a\)\s*/gi, '@')
+		.replace(/\s*\{at\}\s*/gi, '@')
+		.replace(/\s*\bat\b\s*/gi, '@')
+		.replace(/&#64;/g, '@')
+		.replace(/&#46;/g, '.')
+		.replace(/\s*\(dot\)\s*/gi, '.')
+		.replace(/\s*\[dot\]\s*/gi, '.')
+		.replace(/%40/g, '@')
+		.trim();
 }
 
 function extractEmail(html: string, businessText: string): string | null {
