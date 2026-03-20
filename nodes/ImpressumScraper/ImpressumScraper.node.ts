@@ -24,12 +24,19 @@ interface ScrapeJob {
 	homepageFinalUrl?: string;
 	impressumUrl?: string | null;
 	impressumHtml?: string;
+	/** Combined text from fallback pages (contact, about, etc.) when no impressum found */
+	fallbackText?: string;
 	error?: string;
 }
 
 const COMMON_IMPRESSUM_PATHS = [
 	'/impressum', '/impressum/', '/impressum.html',
 	'/impressum.php', '/imprint', '/imprint/',
+];
+
+const FALLBACK_PATHS = [
+	'/contact', '/kontakt', '/about', '/about-us', '/ueber-uns',
+	'/legal', '/legal-notice', '/disclaimer',
 ];
 
 const HTTP_CONCURRENCY = 10;
@@ -311,7 +318,62 @@ export class ImpressumScraper implements INodeType {
 				if (result) {
 					job.impressumHtml = result.html;
 				} else {
-					job.error = `Failed to fetch impressum page: ${job.impressumUrl}`;
+					// Impressum page is dead — clear it so fallback kicks in
+					job.impressumUrl = null;
+				}
+			}
+		}
+
+		// ── Phase 4b: Fallback pages for jobs without impressum ─────
+		const jobsWithoutImpressum = jobsWithHomepage.filter(
+			(j) => (!j.impressumUrl || !j.impressumHtml) && !j.error,
+		);
+
+		if (jobsWithoutImpressum.length > 0) {
+			// Find contact/about/legal links from homepage HTML
+			const fallbackCandidates: Array<{ url: string; jobIdx: number }> = [];
+			for (let ji = 0; ji < jobsWithoutImpressum.length; ji++) {
+				const job = jobsWithoutImpressum[ji];
+				const baseUrl = job.homepageFinalUrl || job.normalizedUrl;
+
+				// Scan homepage for contact/about/legal links
+				const foundUrls = findFallbackUrls(job.homepageHtml!, baseUrl);
+				for (const u of foundUrls) {
+					fallbackCandidates.push({ url: u, jobIdx: ji });
+				}
+
+				// Also try common fallback paths
+				const base = new URL(baseUrl);
+				for (const path of FALLBACK_PATHS) {
+					fallbackCandidates.push({ url: new URL(path, base).href, jobIdx: ji });
+				}
+			}
+
+			if (fallbackCandidates.length > 0) {
+				const uniqueUrls = [...new Set(fallbackCandidates.map((c) => c.url))];
+				const fallbackResults = await fetchMany(this, uniqueUrls, timeout, apifyToken);
+
+				// Group fetched texts per job
+				const textsPerJob = new Map<number, string[]>();
+				for (const { url, jobIdx } of fallbackCandidates) {
+					const result = fallbackResults.get(url);
+					if (result && result.html.length > 200) {
+						if (!textsPerJob.has(jobIdx)) textsPerJob.set(jobIdx, []);
+						textsPerJob.get(jobIdx)!.push(htmlToText(result.html));
+					}
+				}
+
+				for (let ji = 0; ji < jobsWithoutImpressum.length; ji++) {
+					const job = jobsWithoutImpressum[ji];
+					const parts: string[] = [];
+					// Always include homepage text
+					if (job.homepageHtml) parts.push(htmlToText(job.homepageHtml));
+					// Add fallback page texts
+					const extra = textsPerJob.get(ji);
+					if (extra) parts.push(...extra);
+					if (parts.length > 0) {
+						job.fallbackText = parts.join('\n\n---\n\n');
+					}
 				}
 			}
 		}
@@ -328,27 +390,36 @@ export class ImpressumScraper implements INodeType {
 				continue;
 			}
 
-			if (!job.impressumUrl || !job.impressumHtml) {
+			if (job.impressumUrl && job.impressumHtml) {
+				// Standard path: dedicated impressum page found
+				const text = htmlToText(job.impressumHtml);
+				const data = extractImpressumData(
+					job.impressumHtml,
+					text,
+					job.impressumUrl,
+					job.inputUrl,
+				);
+				successfulJobs.push({ job, data, text });
+			} else if (job.fallbackText && openAiKey) {
+				// Fallback path: no impressum, but we have page text + OpenAI
+				const data = emptyImpressumResult(job.inputUrl);
+				successfulJobs.push({ job, data, text: job.fallbackText });
+			} else {
 				returnData.push({
 					json: { sourceUrl: job.inputUrl, error: `No Impressum page found for ${job.normalizedUrl}`, success: false },
 					pairedItem: { item: job.itemIndex },
 				});
-				continue;
 			}
-
-			const text = htmlToText(job.impressumHtml);
-			const data = extractImpressumData(
-				job.impressumHtml,
-				text,
-				job.impressumUrl,
-				job.inputUrl,
-			);
-			successfulJobs.push({ job, data, text });
 		}
 
 		// ── Phase 6: Plausibility check + OpenAI enrichment ─────────
 		if (openAiKey && successfulJobs.length > 0) {
 			await enrichWithOpenAi(this, successfulJobs, openAiKey, openAiModel);
+		}
+
+		// ── Phase 7: Derive salutation from firstName via OpenAI ───
+		if (openAiKey && successfulJobs.length > 0) {
+			await deriveSalutations(this, successfulJobs, openAiKey, openAiModel);
 		}
 
 		// ── Push final results ──────────────────────────────────────
@@ -796,6 +867,36 @@ async function callOpenAi(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Fallback URL Finding (contact, about, legal pages)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function findFallbackUrls(html: string, baseUrl: string): string[] {
+	const found = new Set<string>();
+	const linkRegex = /<a\s[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+	let match;
+
+	const FALLBACK_HREF = /\/(contact|kontakt|about|about-us|ueber-uns|legal|legal-notice|disclaimer|privacy|datenschutz)\b/i;
+	const FALLBACK_TEXT = /\b(contact|kontakt|about\s*us|über\s*uns|legal|disclaimer|datenschutz)\b/i;
+
+	while ((match = linkRegex.exec(html)) !== null) {
+		const href = match[1].trim();
+		const linkText = match[2].replace(/<[^>]+>/g, '').trim();
+
+		if (FALLBACK_HREF.test(href) || FALLBACK_TEXT.test(linkText)) {
+			try {
+				const resolved = new URL(href, baseUrl);
+				// Only same-origin links
+				if (resolved.origin === new URL(baseUrl).origin) {
+					found.add(resolved.href);
+				}
+			} catch { /* skip invalid */ }
+		}
+	}
+
+	return [...found];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Impressum Link Finding
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -928,6 +1029,91 @@ interface ImpressumResult {
 	professionalTitle: string | null;
 	website: string | null;
 	managingDirector: string | null;
+}
+
+function emptyImpressumResult(sourceUrl: string): ImpressumResult {
+	return {
+		sourceUrl,
+		impressumUrl: '',
+		companyName: null, salutation: null, title: null,
+		firstName: null, lastName: null,
+		email: null, phone: null, fax: null, mobile: null,
+		vatId: null, taxNumber: null,
+		street: null, postalCode: null, city: null, country: null,
+		registrationCourt: null, registrationNumber: null,
+		chamber: null, supervisoryAuthority: null, professionalTitle: null,
+		website: null, managingDirector: null,
+	};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Salutation Derivation from First Name
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Batches all firstNames missing a salutation into a single OpenAI call.
+ * Returns "Herr" or "Frau" for each name.
+ */
+async function deriveSalutations(
+	ctx: IExecuteFunctions,
+	results: Array<{ job: ScrapeJob; data: ImpressumResult; text: string }>,
+	openAiKey: string,
+	model: string,
+): Promise<void> {
+	const needsSalutation: Array<{ idx: number; firstName: string }> = [];
+
+	for (let i = 0; i < results.length; i++) {
+		const { data } = results[i];
+		if (!data.salutation && data.firstName) {
+			needsSalutation.push({ idx: i, firstName: data.firstName });
+		}
+	}
+
+	if (needsSalutation.length === 0) return;
+
+	const nameList = needsSalutation.map((n) => n.firstName).join(', ');
+
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.openai.com/v1/chat/completions',
+			headers: {
+				Authorization: `Bearer ${openAiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: {
+				model,
+				temperature: 0,
+				response_format: { type: 'json_object' },
+				messages: [
+					{
+						role: 'system',
+						content:
+							'For each given first name, determine the German salutation: "Herr" (male) or "Frau" (female). Return a JSON object mapping each name to its salutation. If unsure, omit the name.',
+					},
+					{
+						role: 'user',
+						content: nameList,
+					},
+				],
+			},
+			timeout: 15000,
+		});
+
+		const content = response?.choices?.[0]?.message?.content;
+		if (!content) return;
+
+		const mapping: Record<string, string> = JSON.parse(content);
+
+		for (const { idx, firstName } of needsSalutation) {
+			const val = mapping[firstName];
+			if (val === 'Herr' || val === 'Frau') {
+				results[idx].data.salutation = val;
+			}
+		}
+	} catch {
+		// Salutation derivation is best-effort
+	}
 }
 
 function extractImpressumData(
