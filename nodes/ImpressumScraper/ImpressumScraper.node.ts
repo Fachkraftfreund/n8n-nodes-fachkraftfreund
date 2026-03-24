@@ -290,6 +290,7 @@ export class ImpressumScraper implements INodeType {
 			country?: string;
 		};
 		const timeout = (options.timeout ?? 15) * 1000;
+		const searchTimeout = Math.max(timeout, 30000);
 		const tryCommonPaths = options.tryCommonPaths !== false;
 		const checkHomepage = options.checkHomepage !== false;
 		const country = options.country || 'de';
@@ -315,12 +316,12 @@ export class ImpressumScraper implements INodeType {
 						: `${job.companyName} ${job.city}`;
 
 					// Search Google first
-					let allRawResults = await searchWeb(this, query, country, searchApiKey, 'google');
+					let allRawResults = await searchWeb(this, query, country, searchApiKey, 'google', searchTimeout);
 					let filtered = filterSearchResults(allRawResults);
 
 					// Bing fallback: if Google results don't seem to contain the company's own site
 					if (filtered.length === 0 || !hasLikelyOwnWebsite(filtered, job.companyName, job.city)) {
-						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing');
+						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing', searchTimeout);
 						allRawResults = [...allRawResults, ...bingResults];
 						const bingFiltered = filterSearchResults(bingResults);
 						if (bingFiltered.length > 0) {
@@ -697,6 +698,46 @@ export class ImpressumScraper implements INodeType {
 			}
 		}
 
+		// ── Phase 5c: JS fallback for placeholder-obfuscated emails ──
+		if (apifyToken) {
+			const jsRefetchJobs = successfulJobs.filter(({ job, data }) => {
+				if (data.emails.length > 0) return false;
+				const html = job.impressumHtml || job.homepageHtml || '';
+				return htmlHasPlaceholderEmails(html);
+			});
+
+			if (jsRefetchJobs.length > 0) {
+				const urlsToRefetch: string[] = [];
+				const urlToJobIdx = new Map<string, number[]>();
+				for (let i = 0; i < jsRefetchJobs.length; i++) {
+					const { job } = jsRefetchJobs[i];
+					const url = job.impressumUrl || job.normalizedUrl;
+					if (url) {
+						urlsToRefetch.push(url);
+						const existing = urlToJobIdx.get(url) || [];
+						existing.push(i);
+						urlToJobIdx.set(url, existing);
+					}
+				}
+
+				const jsResults = await fetchWithJsApify(this, [...new Set(urlsToRefetch)], apifyToken);
+
+				for (const [url, result] of jsResults) {
+					const indices = urlToJobIdx.get(url) || [];
+					for (const idx of indices) {
+						const { job, data } = jsRefetchJobs[idx];
+						const jsText = htmlToText(result.html);
+						const jsEmails = extractEmails(result.html, jsText);
+						if (jsEmails.length > 0) {
+							data.emails = jsEmails;
+							// Update stored HTML so later phases benefit too
+							if (job.impressumHtml) job.impressumHtml = result.html;
+						}
+					}
+				}
+			}
+		}
+
 		// ── Phase 6: Plausibility check + OpenAI enrichment ─────────
 		if (openAiKey && successfulJobs.length > 0) {
 			await enrichWithOpenAi(this, successfulJobs, openAiKey, openAiModel);
@@ -725,6 +766,7 @@ export class ImpressumScraper implements INodeType {
 			});
 		}
 
+		returnData.sort((a, b) => (a.pairedItem as { item: number }).item - (b.pairedItem as { item: number }).item);
 		return [returnData];
 	}
 }
@@ -785,31 +827,40 @@ async function fetchDirectSafe(
 	url: string,
 	timeout: number,
 ): Promise<FetchResult | null> {
-	try {
-		const response = await ctx.helpers.httpRequest({
-			method: 'GET',
-			url,
-			headers: {
-				'User-Agent': USER_AGENT,
-				Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-				'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
-			},
-			returnFullResponse: true,
-			timeout,
-			ignoreHttpStatusErrors: true,
-		});
+	const MAX_ATTEMPTS = 2;
+	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+		try {
+			const response = await ctx.helpers.httpRequest({
+				method: 'GET',
+				url,
+				headers: {
+					'User-Agent': USER_AGENT,
+					Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+					'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
+				},
+				returnFullResponse: true,
+				timeout,
+				ignoreHttpStatusErrors: true,
+			});
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		const fullResp = response as any;
-		if (fullResp.statusCode >= 200 && fullResp.statusCode < 400) {
-			const html =
-				typeof fullResp.body === 'string' ? fullResp.body : JSON.stringify(fullResp.body);
-			return { html, finalUrl: url };
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const fullResp = response as any;
+			if (fullResp.statusCode >= 200 && fullResp.statusCode < 400) {
+				const html =
+					typeof fullResp.body === 'string' ? fullResp.body : JSON.stringify(fullResp.body);
+				return { html, finalUrl: url };
+			}
+			// Non-retriable HTTP error (4xx/5xx) — don't retry
+			return null;
+		} catch {
+			if (attempt < MAX_ATTEMPTS - 1) {
+				await new Promise((r) => setTimeout(r, 2000));
+				continue;
+			}
+			return null;
 		}
-		return null;
-	} catch {
-		return null;
 	}
+	return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -952,6 +1003,94 @@ async function fetchManyApify(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Apify Web Scraper (JS-enabled fallback)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetches pages via Apify Web Scraper (Puppeteer-based), which executes JavaScript.
+ * Used as a targeted fallback when placeholder/obfuscated emails are detected in
+ * static HTML, since the real addresses are often injected by client-side JS.
+ */
+async function fetchWithJsApify(
+	ctx: IExecuteFunctions,
+	urls: string[],
+	apifyToken: string,
+): Promise<Map<string, FetchResult>> {
+	const results = new Map<string, FetchResult>();
+	if (urls.length === 0) return results;
+
+	const pageFunction = `async function pageFunction(context) {
+		return {
+			url: context.request.url,
+			html: await context.page.content(),
+		};
+	}`;
+
+	let resp;
+	try {
+		resp = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.apify.com/v2/acts/apify~web-scraper/runs',
+			qs: { token: apifyToken, memory: 1024 },
+			headers: { 'Content-Type': 'application/json' },
+			body: {
+				startUrls: urls.map((u) => ({ url: u })),
+				maxRequestsPerCrawl: urls.length,
+				pageFunction,
+			},
+		});
+	} catch {
+		return results;
+	}
+
+	const runId = resp?.data?.id;
+	if (!runId) return results;
+
+	// Poll for completion
+	const maxWaitMs = 120_000; // 2 minutes (small batch, single run)
+	const pollMs = 3_000;
+	const t0 = Date.now();
+	let done = false;
+
+	while (!done && Date.now() - t0 < maxWaitMs) {
+		try {
+			const statusResp = await ctx.helpers.httpRequest({
+				method: 'GET',
+				url: `https://api.apify.com/v2/actor-runs/${runId}`,
+				qs: { token: apifyToken },
+			});
+			const status = statusResp?.data?.status;
+			if (['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT'].includes(status)) {
+				done = true;
+			}
+		} catch {
+			// ignore polling errors
+		}
+		if (!done) await new Promise((r) => setTimeout(r, pollMs));
+	}
+
+	// Collect results
+	try {
+		const items = await ctx.helpers.httpRequest({
+			method: 'GET',
+			url: `https://api.apify.com/v2/actor-runs/${runId}/dataset/items`,
+			qs: { token: apifyToken },
+		});
+		if (Array.isArray(items)) {
+			for (const item of items) {
+				if (item.url && item.html) {
+					results.set(item.url, { html: item.html, finalUrl: item.url });
+				}
+			}
+		}
+	} catch {
+		// ignore
+	}
+
+	return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Google Search via SearchAPI
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -966,6 +1105,7 @@ async function searchWeb(
 	country: string,
 	apiKey: string,
 	engine: 'google' | 'bing' = 'google',
+	timeout: number = 30000,
 ): Promise<SearchResult[]> {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const qs: Record<string, any> = {
@@ -979,7 +1119,7 @@ async function searchWeb(
 		method: 'GET',
 		url: 'https://www.searchapi.io/api/v1/search',
 		qs,
-		timeout: 15000,
+		timeout,
 	});
 
 	return (response?.organic_results || [])
@@ -2038,7 +2178,7 @@ function extractEmails(html: string, businessText: string): string[] {
 
 	const addEmail = (email: string) => {
 		const normalized = email.toLowerCase().trim();
-		if (!seen.has(normalized) && !isChamberEmail(normalized)) {
+		if (!seen.has(normalized) && !isChamberEmail(normalized) && !isPlaceholderEmail(normalized)) {
 			seen.add(normalized);
 			found.push(email.trim());
 		}
@@ -2102,6 +2242,34 @@ function isChamberEmail(email: string): boolean {
 		'bzaek.de',
 	];
 	return chamberDomains.some((d) => email.toLowerCase().includes(d));
+}
+
+function isPlaceholderEmail(email: string): boolean {
+	const domain = email.split('@')[1] || '';
+	const placeholderDomains = [
+		'example.com', 'example.org', 'example.net',
+		'domain.com', 'domain.de', 'domain.tld',
+		'domain1.tld', 'domain2.tld',
+		'muster.de', 'musterfirma.de',
+		'test.com', 'test.de', 'test.tld',
+		'localhost', 'email.com', 'email.de',
+		'ihre-domain.de', 'your-domain.com',
+		'platzhalter.de', 'placeholder.com',
+	];
+	if (placeholderDomains.includes(domain)) return true;
+	// Catch patterns like domain<N>.tld, example<N>.com
+	if (/^(domain|example|test|muster)\d*\.\w+$/.test(domain)) return true;
+	return false;
+}
+
+/** Check if HTML contains email addresses with placeholder domains (JS obfuscation pattern). */
+function htmlHasPlaceholderEmails(html: string): boolean {
+	const emailRegex = /[\w.-]+@[\w.-]+\.\w{2,}/g;
+	let match;
+	while ((match = emailRegex.exec(html)) !== null) {
+		if (isPlaceholderEmail(match[0].toLowerCase())) return true;
+	}
+	return false;
 }
 
 function extractPhones(businessText: string): string[] {
