@@ -1249,7 +1249,7 @@ const EXTRACTABLE_FIELDS: Record<string, string> = {
 	vatId: 'VAT ID / USt-IdNr (format: DE followed by 9 digits)',
 	taxNumber: 'Tax number / Steuernummer',
 	street: 'Street address with house number (Straße + Hausnummer)',
-	postalCode: 'German postal code, exactly 5 digits (Postleitzahl)',
+	postalCode: 'Postal code / Postleitzahl (4-5 digits for DACH region)',
 	city: 'City name (Stadt / Ort)',
 	registrationCourt: 'Registration court (Registergericht / Amtsgericht)',
 	registrationNumber: 'Registration number (e.g. HRB 12345)',
@@ -1699,6 +1699,7 @@ interface ImpressumResult {
 	postalCode: string | null;
 	city: string | null;
 	country: string | null;
+	countryCode: string | null;
 	registrationCourt: string | null;
 	registrationNumber: string | null;
 	chamber: string | null;
@@ -1864,6 +1865,66 @@ async function normalizePhoneNumbers(
 	}
 }
 
+const COUNTRY_CODE_BY_TLD: Record<string, string> = {
+	de: 'DE', at: 'AT', ch: 'CH', li: 'LI', lu: 'LU',
+};
+
+const COUNTRY_NAME_BY_CODE: Record<string, string> = {
+	DE: 'Deutschland', AT: 'Österreich', CH: 'Schweiz', LI: 'Liechtenstein', LU: 'Luxemburg',
+};
+
+const COUNTRY_CODE_BY_PHONE_PREFIX: Array<[string, string]> = [
+	['+49', 'DE'], ['+43', 'AT'], ['+41', 'CH'], ['+423', 'LI'], ['+352', 'LU'],
+	['0049', 'DE'], ['0043', 'AT'], ['0041', 'CH'],
+];
+
+function deriveCountryCode(
+	siteDomain: string | undefined,
+	phones: string[],
+	postalCode: string | null,
+	vatId: string | null,
+): string {
+	// 1. TLD
+	if (siteDomain) {
+		const tld = siteDomain.split('.').pop()?.toLowerCase() || '';
+		if (COUNTRY_CODE_BY_TLD[tld]) return COUNTRY_CODE_BY_TLD[tld];
+	}
+
+	// 2. VAT ID prefix
+	if (vatId) {
+		const prefix = vatId.replace(/\s/g, '').substring(0, 2).toUpperCase();
+		if (COUNTRY_NAME_BY_CODE[prefix]) return prefix;
+	}
+
+	// 3. Phone prefix
+	for (const phone of phones) {
+		const cleaned = phone.replace(/[\s\-()]/g, '');
+		for (const [prefix, code] of COUNTRY_CODE_BY_PHONE_PREFIX) {
+			if (cleaned.startsWith(prefix)) return code;
+		}
+	}
+
+	// 4. Postal code pattern
+	if (postalCode) {
+		const pc = postalCode.replace(/\s/g, '');
+		if (/^\d{5}$/.test(pc)) return 'DE';
+		if (/^\d{4}$/.test(pc)) {
+			const num = parseInt(pc, 10);
+			if (num >= 1000 && num <= 9999) {
+				// Austrian codes: 1010-9992; Swiss codes: 1000-9658
+				// Overlap exists, but Austrian codes >= 1010 with leading 1-9 are common
+				// Swiss codes never start with 0; use VAT/phone as tiebreaker above
+				// Without better signal, prefer CH for 1xxx-4xxx, AT for 5xxx-9xxx
+				if (num >= 5000) return 'AT';
+				return 'CH';
+			}
+		}
+	}
+
+	// 5. Default
+	return 'DE';
+}
+
 function extractImpressumData(
 	html: string,
 	fullText: string,
@@ -1882,6 +1943,10 @@ function extractImpressumData(
 		siteDomain = new URL(sourceUrl || impressumUrl).hostname.replace(/^www\./, '');
 	} catch { /* ignore */ }
 
+	const phones = extractPhones(business);
+	const vatId = extractVatId(section);
+	const countryCode = deriveCountryCode(siteDomain, phones, address.postalCode, vatId);
+
 	return {
 		sourceUrl,
 		impressumUrl,
@@ -1891,15 +1956,16 @@ function extractImpressumData(
 		firstName: person.firstName,
 		lastName: person.lastName,
 		emails: extractEmails(html, business, siteDomain),
-		phones: extractPhones(business),
+		phones,
 		faxNumbers: extractFaxNumbers(business),
 		mobileNumbers: extractMobileNumbers(business),
-		vatId: extractVatId(section),
+		vatId,
 		taxNumber: extractTaxNumber(section),
 		street: address.street,
 		postalCode: address.postalCode,
 		city: address.city,
-		country: 'Deutschland',
+		country: COUNTRY_NAME_BY_CODE[countryCode] || countryCode,
+		countryCode,
 		registrationCourt: registration.court,
 		registrationNumber: registration.number,
 		chamber: extractChamber(regulatory),
