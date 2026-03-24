@@ -18,6 +18,8 @@ interface FetchResult {
 
 interface ScrapeJob {
 	itemIndex: number;
+	companyName: string;
+	city: string;
 	inputUrl: string;
 	normalizedUrl: string;
 	homepageHtml?: string;
@@ -26,6 +28,8 @@ interface ScrapeJob {
 	impressumHtml?: string;
 	/** Combined text from fallback pages (contact, about, etc.) when no impressum found */
 	fallbackText?: string;
+	/** Directory pages from search results that may link to the actual homepage */
+	directoryPages?: SearchResult[];
 	error?: string;
 }
 
@@ -37,6 +41,63 @@ const COMMON_IMPRESSUM_PATHS = [
 const FALLBACK_PATHS = [
 	'/contact', '/kontakt', '/about', '/about-us', '/ueber-uns',
 	'/legal', '/legal-notice', '/disclaimer',
+];
+
+const EXCLUDED_DOMAINS = [
+	// Social media
+	'facebook.', 'instagram.', 'linkedin.', 'twitter.com', 'x.com',
+	'youtube.com', 'tiktok.com', 'pinterest.', 'reddit.com', 'tumblr.com',
+	// Job boards & career
+	'indeed.', 'stepstone.', 'xing.com', 'glassdoor.', 'kununu.com',
+	'arbeitsagentur.', 'monster.de', 'stellenanzeigen.de', 'careerjet.',
+	'joblift.de', 'jobted.de', 'zfajobs.de', 'www.adecco.com',
+	'greatplacetowork.', 'jobbörse.de',
+	// Medical/dental directories & portals
+	'jameda.de', 'arzt-auskunft.de', 'sanego.de', 'doctolib.',
+	'doccheck.com', 'aerzteverzeichnis.de', 'praktischarzt.de',
+	'zahnarzt-preisvergleich.com', 'zahnarztgo.com',
+	'dental-online-college.com', 'zwp-online.info',
+	// Business directories & yellow pages
+	'gelbeseiten.de', 'dasoertliche', 'branchenbuch', 'golocal.de',
+	'firmenabc.at', 'www.firmenabc.at', 'firmeneintrag.creditreform.de',
+	'meinestadt.de', 'cylex.de', '11880.com', 'kennstdueinen.de',
+	'marktplatz-mittelstand.de', 'hotfrog.de',
+	// Search engines & maps
+	'www.google.com', 'google.de/maps', 'maps.google.',
+	'bing.com', 'duckduckgo.com',
+	// Reference / encyclopedias
+	'wikipedia.', 'wikidata.org',
+	// Review & rating sites
+	'trustpilot.com', 'yelp.', 'bewertung.de',
+	// E-commerce & marketplaces
+	'ebay.', 'amazon.', 'etsy.com',
+	// Hosted platforms (not own domains)
+	'wix.com', 'squarespace.com', 'wordpress.com',
+	// Swiss/Austrian directories
+	'search.ch', 'local.ch',
+	// Government registries (impressum is their own, not the company's)
+	'handelsregister.de', 'unternehmensregister.de', 'bundesanzeiger.de',
+	// Maps & navigation
+	'mapquest.com', 'openstreetmap.org',
+	// Platform infrastructure (parent companies of directory sites)
+	'znanylekarz.pl', 'docplanner.com', 'zendesk.com',
+	// Health/dental aggregators & news
+	'zahnarztmedizin.de', 'focus-gesundheit.de', 'focus.de/gesundheit',
+	'gesundheit.de', 'apotheken-umschau.de',
+];
+
+/** Directory domains that often link to the company's actual homepage.
+ *  These are a SUBSET of EXCLUDED_DOMAINS — they are not the company's own site,
+ *  but their profile pages frequently contain an outgoing "Website" link. */
+const HOMEPAGE_LINK_DIRECTORIES = [
+	// Medical/dental directories
+	'jameda.de', 'doctolib.', 'sanego.de', 'praktischarzt.de',
+	'arzt-auskunft.de', 'aerzteverzeichnis.de',
+	// Business directories / yellow pages
+	'gelbeseiten.de', 'dasoertliche', 'golocal.de',
+	'11880.com', 'cylex.de', 'meinestadt.de',
+	'kennstdueinen.de', 'hotfrog.de', 'branchenbuch',
+	'marktplatz-mittelstand.de', 'firmenabc.at',
 ];
 
 const HTTP_CONCURRENCY = 10;
@@ -55,15 +116,19 @@ export class ImpressumScraper implements INodeType {
 		icon: 'file:impressum.svg',
 		group: ['transform'],
 		version: 1,
-		subtitle: 'Scrape Impressum data from websites',
+		subtitle: 'Find company homepage & scrape Impressum',
 		description:
-			'Crawls websites to find Impressum pages and extracts structured contact/legal data. Uses direct HTTP; optional Apify fallback for resistant sites.',
+			'Searches for a company by name and city, finds the homepage via Google, then crawls the website to extract structured Impressum/legal data.',
 		defaults: {
 			name: 'Impressum Scraper',
 		},
 		inputs: ['main'] as const,
 		outputs: ['main'] as const,
 		credentials: [
+			{
+				name: 'searchApi',
+				required: true,
+			},
 			{
 				name: 'apifyApi',
 				required: false,
@@ -75,14 +140,22 @@ export class ImpressumScraper implements INodeType {
 		],
 		properties: [
 			{
-				displayName: 'URL',
-				name: 'url',
+				displayName: 'Company Name',
+				name: 'companyName',
 				type: 'string',
 				default: '',
 				required: true,
-				description:
-					'The website URL to scrape for Impressum data. Can be a homepage — the node will automatically find the Impressum page.',
-				placeholder: 'https://example.de',
+				description: 'The company name to search for',
+				placeholder: 'Zahnarztpraxis Dr. Müller',
+			},
+			{
+				displayName: 'City',
+				name: 'city',
+				type: 'string',
+				default: '',
+				required: true,
+				description: 'The city where the company is located',
+				placeholder: 'Berlin',
 			},
 			{
 				displayName: 'OpenAI Model',
@@ -102,6 +175,13 @@ export class ImpressumScraper implements INodeType {
 				placeholder: 'Add Option',
 				default: {},
 				options: [
+					{
+						displayName: 'Country Code',
+						name: 'country',
+						type: 'string',
+						default: 'de',
+						description: 'ISO country code for Google search localization (e.g. de, at, ch)',
+					},
 					{
 						displayName: 'Timeout (Seconds)',
 						name: 'timeout',
@@ -186,6 +266,9 @@ export class ImpressumScraper implements INodeType {
 		const returnData: INodeExecutionData[] = [];
 
 		// ── Configuration ───────────────────────────────────────────
+		const searchApiCreds = await this.getCredentials('searchApi');
+		const searchApiKey = searchApiCreds.apiKey as string;
+
 		let apifyToken: string | undefined;
 		try {
 			const creds = await this.getCredentials('apifyApi');
@@ -204,26 +287,192 @@ export class ImpressumScraper implements INodeType {
 			timeout?: number;
 			tryCommonPaths?: boolean;
 			checkHomepage?: boolean;
+			country?: string;
 		};
 		const timeout = (options.timeout ?? 15) * 1000;
 		const tryCommonPaths = options.tryCommonPaths !== false;
 		const checkHomepage = options.checkHomepage !== false;
+		const country = options.country || 'de';
 
 		// ── Initialize jobs ─────────────────────────────────────────
 		const jobs: ScrapeJob[] = [];
 		for (let i = 0; i < items.length; i++) {
-			const url = this.getNodeParameter('url', i) as string;
-			let normalizedUrl = url.trim();
-			if (!/^https?:\/\//i.test(normalizedUrl)) {
-				normalizedUrl = 'https://' + normalizedUrl;
+			const companyName = this.getNodeParameter('companyName', i) as string;
+			const city = this.getNodeParameter('city', i) as string;
+			jobs.push({ itemIndex: i, companyName, city, inputUrl: '', normalizedUrl: '' });
+		}
+
+		// ── Phase 0: Search Google and resolve homepage URLs ─────────
+		const SEARCH_CONCURRENCY = 5;
+		for (let i = 0; i < jobs.length; i += SEARCH_CONCURRENCY) {
+			const batch = jobs.slice(i, i + SEARCH_CONCURRENCY);
+			const settled = await Promise.allSettled(
+				batch.map(async (job) => {
+					const normalizedName = job.companyName.toLowerCase().replace(/[^a-zäöüß\s]/g, '');
+					const normalizedCity = job.city.toLowerCase().replace(/[^a-zäöüß\s]/g, '');
+					const query = normalizedName.includes(normalizedCity)
+						? job.companyName
+						: `${job.companyName} ${job.city}`;
+
+					// Search Google first
+					let allRawResults = await searchWeb(this, query, country, searchApiKey, 'google');
+					let filtered = filterSearchResults(allRawResults);
+
+					// Bing fallback: if Google results don't seem to contain the company's own site
+					if (filtered.length === 0 || !hasLikelyOwnWebsite(filtered, job.companyName, job.city)) {
+						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing');
+						allRawResults = [...allRawResults, ...bingResults];
+						const bingFiltered = filterSearchResults(bingResults);
+						if (bingFiltered.length > 0) {
+							// Merge: Bing results first (they found what Google missed), then Google
+							const seen = new Set(bingFiltered.map((r) => r.link));
+							filtered = [...bingFiltered, ...filtered.filter((r) => !seen.has(r.link))];
+						}
+					}
+
+					// Collect directory pages that may link to the actual homepage
+					const dirPages = allRawResults.filter((r) => {
+						try {
+							const hostname = new URL(r.link).hostname;
+							return HOMEPAGE_LINK_DIRECTORIES.some((d) => hostname.includes(d));
+						} catch { return false; }
+					});
+					const seenDir = new Set<string>();
+					job.directoryPages = dirPages.filter((r) => {
+						if (seenDir.has(r.link)) return false;
+						seenDir.add(r.link);
+						return true;
+					});
+
+					if (filtered.length === 0 && job.directoryPages.length === 0) {
+						job.error = `No search results found for "${job.companyName}" in "${job.city}"`;
+						return;
+					}
+
+					let homepageUrl: string | null = null;
+					if (openAiKey && filtered.length > 1) {
+						homepageUrl = await findHomepageWithOpenAi(this, query, filtered, openAiKey, openAiModel);
+					}
+					if (!homepageUrl && filtered.length > 0) {
+						homepageUrl = filtered[0].link;
+					}
+
+					// If we found a homepage via search, use it
+					if (homepageUrl) {
+						job.inputUrl = homepageUrl;
+						let normalizedUrl = homepageUrl.trim();
+						if (!/^https?:\/\//i.test(normalizedUrl)) {
+							normalizedUrl = 'https://' + normalizedUrl;
+						}
+						try {
+							new URL(normalizedUrl);
+						} catch {
+							job.error = `Invalid URL resolved from search: ${homepageUrl}`;
+							return;
+						}
+						job.normalizedUrl = normalizedUrl;
+					}
+					// Otherwise leave normalizedUrl empty — Phase 0b will try directory pages
+				}),
+			);
+
+			for (let j = 0; j < batch.length; j++) {
+				if (settled[j].status === 'rejected') {
+					batch[j].error = `Search failed: ${(settled[j] as PromiseRejectedResult).reason?.message || 'Unknown error'}`;
+				}
 			}
-			try {
-				new URL(normalizedUrl);
-			} catch {
-				jobs.push({ itemIndex: i, inputUrl: url, normalizedUrl, error: `Invalid URL: ${url}` });
-				continue;
+		}
+
+		// ── Phase 0b: Directory homepage discovery (fallback) ──────
+		const jobsNeedingHomepage = jobs.filter(
+			(j) => !j.error && !j.normalizedUrl && j.directoryPages && j.directoryPages.length > 0,
+		);
+
+		if (jobsNeedingHomepage.length > 0) {
+			const allDirUrls: string[] = [];
+			for (const job of jobsNeedingHomepage) {
+				for (const r of job.directoryPages!.slice(0, 3)) {
+					allDirUrls.push(r.link);
+				}
 			}
-			jobs.push({ itemIndex: i, inputUrl: url, normalizedUrl });
+			const uniqueDirUrls = [...new Set(allDirUrls)];
+			const dirFetchResults = await fetchMany(this, uniqueDirUrls, timeout, apifyToken);
+
+			for (const job of jobsNeedingHomepage) {
+				const dirUrls = job.directoryPages!.slice(0, 3).map((r) => r.link);
+				for (const dirUrl of dirUrls) {
+					const result = dirFetchResults.get(dirUrl);
+					if (result && result.html) {
+						const discovered = extractHomepageLinkFromDirectory(result.html, dirUrl);
+						if (discovered) {
+							job.inputUrl = discovered;
+							let normalizedUrl = discovered.trim();
+							if (!/^https?:\/\//i.test(normalizedUrl)) {
+								normalizedUrl = 'https://' + normalizedUrl;
+							}
+							try {
+								new URL(normalizedUrl);
+								job.normalizedUrl = normalizedUrl;
+								break;
+							} catch { /* skip invalid */ }
+						}
+					}
+				}
+				if (!job.normalizedUrl) {
+					job.error = `No homepage found for "${job.companyName}" in "${job.city}" (checked ${dirUrls.length} directory pages)`;
+				}
+			}
+		}
+
+		// ── Phase 0c: Domain guessing fallback (OpenAI) ─────────────
+		if (openAiKey) {
+			const jobsStillNeedingHomepage = jobs.filter(
+				(j) => !j.normalizedUrl && !j.error,
+			);
+			// Also include jobs that got an error in Phase 0b (directory failure)
+			const jobsFromDirFailure = jobs.filter(
+				(j) => j.error && j.error.includes('checked') && j.error.includes('directory pages'),
+			);
+			const allGuessJobs = [...jobsStillNeedingHomepage, ...jobsFromDirFailure];
+
+			if (allGuessJobs.length > 0) {
+				for (let i = 0; i < allGuessJobs.length; i += OPENAI_CONCURRENCY) {
+					const batch = allGuessJobs.slice(i, i + OPENAI_CONCURRENCY);
+					const settled = await Promise.allSettled(
+						batch.map(async (job) => {
+							const guesses = await guessDomains(this, job.companyName, job.city, openAiKey, openAiModel);
+							if (guesses.length === 0) return;
+
+							// Verify which domains exist (parallel HEAD requests)
+							const checks = await Promise.allSettled(
+								guesses.slice(0, 8).map(async (domain) => {
+									const exists = await domainExists(this, domain, timeout);
+									return { domain, exists };
+								}),
+							);
+
+							for (const check of checks) {
+								if (check.status === 'fulfilled' && check.value.exists) {
+									const url = `https://${check.value.domain}`;
+									job.inputUrl = url;
+									job.normalizedUrl = url;
+									job.error = undefined;
+									return;
+								}
+							}
+						}),
+					);
+					// Errors are silently ignored — domain guessing is best-effort
+					void settled;
+				}
+			}
+		}
+
+		// Mark remaining jobs with no homepage and no error
+		for (const job of jobs) {
+			if (!job.error && !job.normalizedUrl) {
+				job.error = `No homepage found for "${job.companyName}" in "${job.city}"`;
+			}
 		}
 
 		const validJobs = jobs.filter((j) => !j.error);
@@ -384,7 +633,7 @@ export class ImpressumScraper implements INodeType {
 		for (const job of jobs) {
 			if (job.error) {
 				returnData.push({
-					json: { sourceUrl: job.inputUrl, error: job.error, success: false },
+					json: { inputCompanyName: job.companyName, inputCity: job.city, sourceUrl: job.inputUrl, error: job.error, success: false },
 					pairedItem: { item: job.itemIndex },
 				});
 				continue;
@@ -408,7 +657,7 @@ export class ImpressumScraper implements INodeType {
 				successfulJobs.push({ job, data, text });
 			} else {
 				returnData.push({
-					json: { sourceUrl: job.inputUrl, error: `No Impressum page found for ${job.normalizedUrl}`, success: false },
+					json: { inputCompanyName: job.companyName, inputCity: job.city, sourceUrl: job.inputUrl, error: `No Impressum page found for ${job.normalizedUrl}`, success: false },
 					pairedItem: { item: job.itemIndex },
 				});
 			}
@@ -420,11 +669,13 @@ export class ImpressumScraper implements INodeType {
 			// Skip if impressum was already the homepage
 			if (job.impressumUrl === job.homepageFinalUrl || job.impressumUrl === job.normalizedUrl) continue;
 
-			// Check if there are null fields worth filling
+			// Check if there are empty fields worth filling
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const d = data as any;
-			const nullFields = Object.keys(EXTRACTABLE_FIELDS).filter((f) => d[f] === null);
-			if (nullFields.length === 0) continue;
+			const emptyFields = Object.keys(EXTRACTABLE_FIELDS).filter((f) =>
+				ARRAY_FIELDS.has(f) ? (d[f] as unknown[]).length === 0 : d[f] === null,
+			);
+			if (emptyFields.length === 0) continue;
 
 			const homepageText = htmlToText(job.homepageHtml);
 			const homepageData = extractImpressumData(
@@ -434,11 +685,13 @@ export class ImpressumScraper implements INodeType {
 				job.inputUrl,
 			);
 
-			// Only fill null fields — never override impressum-extracted values
+			// Only fill empty fields — never override impressum-extracted values
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const hd = homepageData as any;
-			for (const field of nullFields) {
-				if (hd[field] != null) {
+			for (const field of emptyFields) {
+				if (ARRAY_FIELDS.has(field)) {
+					if ((hd[field] as unknown[]).length > 0) d[field] = hd[field];
+				} else if (hd[field] != null) {
 					d[field] = hd[field];
 				}
 			}
@@ -456,13 +709,18 @@ export class ImpressumScraper implements INodeType {
 
 		// ── Phase 8: Normalize emails ──────────────────────────────
 		for (const { data } of successfulJobs) {
-			if (data.email) data.email = normalizeEmail(data.email);
+			data.emails = data.emails.map(normalizeEmail);
+		}
+
+		// ── Phase 9: Normalize phone numbers via OpenAI ──────────
+		if (openAiKey && successfulJobs.length > 0) {
+			await normalizePhoneNumbers(this, successfulJobs, openAiKey, openAiModel);
 		}
 
 		// ── Push final results ──────────────────────────────────────
 		for (const { job, data } of successfulJobs) {
 			returnData.push({
-				json: { ...data, success: true },
+				json: { inputCompanyName: job.companyName, inputCity: job.city, ...data, success: true },
 				pairedItem: { item: job.itemIndex },
 			});
 		}
@@ -694,6 +952,145 @@ async function fetchManyApify(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Google Search via SearchAPI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+interface SearchResult {
+	title: string;
+	link: string;
+}
+
+async function searchWeb(
+	ctx: IExecuteFunctions,
+	query: string,
+	country: string,
+	apiKey: string,
+	engine: 'google' | 'bing' = 'google',
+): Promise<SearchResult[]> {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const qs: Record<string, any> = {
+		q: query,
+		engine,
+		api_key: apiKey,
+	};
+	if (engine === 'google') qs.gl = country;
+
+	const response = await ctx.helpers.httpRequest({
+		method: 'GET',
+		url: 'https://www.searchapi.io/api/v1/search',
+		qs,
+		timeout: 15000,
+	});
+
+	return (response?.organic_results || [])
+		.map((r: { title?: string; link?: string }) => ({
+			title: r.title || '',
+			link: r.link || '',
+		}))
+		.filter((r: SearchResult) => r.link);
+}
+
+/**
+ * Heuristic: do any of the filtered results look like they belong to the company's
+ * own website? Extracts keywords from the company name/city and checks if any
+ * result's domain contains them. If not, we should try another search engine.
+ */
+function hasLikelyOwnWebsite(results: SearchResult[], companyName: string, city: string): boolean {
+	const UMLAUT_MAP: Record<string, string> = { 'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss' };
+	const normalize = (s: string) =>
+		s.toLowerCase().replace(/[äöüß]/g, (c) => UMLAUT_MAP[c] || c).replace(/[^a-z\s]/g, '');
+
+	// Skip generic words that don't help identify a specific company's domain
+	const SKIP = /^(zahnarzt|praxis|zahnarztpraxis|kieferorthopaedie|kiefer|orthopaede|arzt|arztpraxis|klinik|zentrum|institut|gmbh|gbr|ohg|ug|dr|prof|med|dent|dipl|und|am|im|an|der|die|das|den|dem|fuer|von|zu|zur|zum)$/;
+
+	const keywords = [...normalize(companyName).split(/\s+/), ...normalize(city).split(/\s+/)]
+		.filter((w) => w.length >= 3 && !SKIP.test(w));
+
+	if (keywords.length === 0) return false;
+
+	for (const r of results) {
+		try {
+			const hostname = new URL(r.link).hostname.toLowerCase();
+			if (keywords.some((kw) => hostname.includes(kw))) return true;
+		} catch { /* skip invalid */ }
+	}
+	return false;
+}
+
+function filterSearchResults(results: SearchResult[]): SearchResult[] {
+	return results.filter((r) => {
+		const url = r.link;
+		return !EXCLUDED_DOMAINS.some((domain) => url.includes(domain));
+	});
+}
+
+async function findHomepageWithOpenAi(
+	ctx: IExecuteFunctions,
+	companyQuery: string,
+	results: SearchResult[],
+	openAiKey: string,
+	model: string,
+): Promise<string | null> {
+	const urlList = results
+		.map((r) => `title: "${r.title}"\nurl: ${r.link}`)
+		.join('\n\n');
+
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.openai.com/v1/chat/completions',
+			headers: {
+				Authorization: `Bearer ${openAiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: {
+				model,
+				temperature: 0,
+				messages: [
+					{
+						role: 'system',
+						content:
+							'You are a web search result evaluation bot. You get a company name and a list of search results. Return ONLY the URL from the provided list that most likely belongs to the company\'s own website. Prefer the root/homepage URL if available, but any page on their own domain is fine. You MUST pick one of the given URLs — never invent or guess a URL. Return just the URL, nothing else.',
+					},
+					{
+						role: 'user',
+						content: `### Company:\n\n${companyQuery}\n\n### URLs:\n\n${urlList}`,
+					},
+				],
+			},
+			timeout: 15000,
+		});
+
+		const content = response?.choices?.[0]?.message?.content?.trim();
+		if (!content) return null;
+
+		// Extract URL from response
+		let candidate: string | null = null;
+		if (/^https?:\/\//i.test(content)) {
+			candidate = content;
+		} else {
+			const urlMatch = content.match(/https?:\/\/[^\s"'<>]+/);
+			candidate = urlMatch ? urlMatch[0] : null;
+		}
+
+		if (!candidate) return null;
+
+		// Validate the URL is from the provided results (prevent hallucination)
+		const knownUrls = new Set(results.map((r) => r.link));
+		if (knownUrls.has(candidate)) return candidate;
+
+		// Try matching by domain — OpenAI may have returned a slightly different path
+		const candidateDomain = new URL(candidate).hostname;
+		const domainMatch = results.find((r) => {
+			try { return new URL(r.link).hostname === candidateDomain; } catch { return false; }
+		});
+		return domainMatch ? domainMatch.link : null;
+	} catch {
+		return null;
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Plausibility Check + OpenAI Enrichment
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -703,10 +1100,10 @@ const EXTRACTABLE_FIELDS: Record<string, string> = {
 	title: 'Academic/professional title (e.g. Dr., Prof., Dr. med., Dr. med. dent.)',
 	firstName: 'First name (Vorname)',
 	lastName: 'Last name (Nachname)',
-	email: 'Email address',
-	phone: 'Phone number (Telefon)',
-	fax: 'Fax number (Telefax)',
-	mobile: 'Mobile number (Mobil / Handy)',
+	emails: 'All email addresses found (as JSON array of strings)',
+	phones: 'All phone numbers found (as JSON array of strings, E.164 or local format)',
+	faxNumbers: 'All fax numbers found (as JSON array of strings)',
+	mobileNumbers: 'All mobile numbers found (as JSON array of strings)',
 	vatId: 'VAT ID / USt-IdNr (format: DE followed by 9 digits)',
 	taxNumber: 'Tax number / Steuernummer',
 	street: 'Street address with house number (Straße + Hausnummer)',
@@ -722,6 +1119,8 @@ const EXTRACTABLE_FIELDS: Record<string, string> = {
 };
 
 const OPENAI_CONCURRENCY = 5;
+
+const ARRAY_FIELDS = new Set(['emails', 'phones', 'faxNumbers', 'mobileNumbers']);
 
 /**
  * Checks if regex-extracted data looks plausible.
@@ -740,7 +1139,7 @@ function isPlausible(data: ImpressumResult): boolean {
 	if (!hasIdentity) return false;
 
 	// Must have at least one contact method
-	const hasContact = data.email || data.phone || data.mobile;
+	const hasContact = data.emails.length > 0 || data.phones.length > 0 || data.mobileNumbers.length > 0;
 	if (!hasContact) return false;
 
 	// Company name sanity: reject nav/menu fragments
@@ -751,13 +1150,10 @@ function isPlausible(data: ImpressumResult): boolean {
 	}
 
 	// Email sanity
-	if (data.email && !/^[\w.+-]+@[\w.-]+\.\w{2,}$/.test(data.email)) return false;
+	if (data.emails.length > 0 && !data.emails.some((e) => /^[\w.+-]+@[\w.-]+\.\w{2,}$/.test(e))) return false;
 
-	// Phone sanity: at least 6 digits
-	if (data.phone) {
-		const digits = data.phone.replace(/\D/g, '');
-		if (digits.length < 6) return false;
-	}
+	// Phone sanity: at least 6 digits in at least one number
+	if (data.phones.length > 0 && !data.phones.some((p) => p.replace(/\D/g, '').length >= 6)) return false;
 
 	// Address consistency: if we have one part, we should have the other
 	if ((data.postalCode && !data.city) || (data.city && !data.postalCode)) return false;
@@ -785,11 +1181,11 @@ async function enrichWithOpenAi(
 			// Implausible → send everything to OpenAI for a full re-parse
 			fullReparse.push(i);
 		} else {
-			// Plausible → only enrich null fields
+			// Plausible → only enrich empty fields
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const d = data as any;
-			const missing = Object.keys(EXTRACTABLE_FIELDS).filter(
-				(f) => d[f] === null || d[f] === undefined,
+			const missing = Object.keys(EXTRACTABLE_FIELDS).filter((f) =>
+				ARRAY_FIELDS.has(f) ? (d[f] as unknown[]).length === 0 : d[f] === null || d[f] === undefined,
 			);
 			if (missing.length > 0) {
 				partialEnrich.push({ idx: i, missingFields: missing });
@@ -821,7 +1217,13 @@ async function enrichWithOpenAi(
 				// Override ALL fields from OpenAI (full re-parse)
 				for (const field of allFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
-						data[field] = String(extracted[field]);
+						if (ARRAY_FIELDS.has(field)) {
+							data[field] = Array.isArray(extracted[field])
+								? (extracted[field] as string[]).map(String)
+								: [String(extracted[field])];
+						} else {
+							data[field] = String(extracted[field]);
+						}
 					}
 				}
 			}
@@ -847,10 +1249,16 @@ async function enrichWithOpenAi(
 				const data = results[idx].data as any;
 				const extracted = resp.value;
 
-				// Only fill null fields — never override regex results
+				// Only fill empty fields — never override regex results
 				for (const field of missingFields) {
-					if (extracted[field] != null && extracted[field] !== '' && data[field] === null) {
-						data[field] = String(extracted[field]);
+					if (extracted[field] != null && extracted[field] !== '') {
+						if (ARRAY_FIELDS.has(field) && (data[field] as unknown[]).length === 0) {
+							data[field] = Array.isArray(extracted[field])
+								? (extracted[field] as string[]).map(String)
+								: [String(extracted[field])];
+						} else if (!ARRAY_FIELDS.has(field) && data[field] === null) {
+							data[field] = String(extracted[field]);
+						}
 					}
 				}
 			}
@@ -864,7 +1272,7 @@ async function callOpenAi(
 	fields: string[],
 	apiKey: string,
 	model: string,
-): Promise<Record<string, string> | null> {
+): Promise<Record<string, unknown> | null> {
 	const fieldList = fields.map((f) => `- ${f}: ${EXTRACTABLE_FIELDS[f]}`).join('\n');
 	const truncated = impressumText.length > 4000 ? impressumText.substring(0, 4000) : impressumText;
 
@@ -884,7 +1292,7 @@ async function callOpenAi(
 					{
 						role: 'system',
 						content:
-							'You extract structured data from German Impressum (legal notice) texts. Return a flat JSON object with ONLY the fields you can confidently identify in the text. Do NOT guess, invent, or hallucinate values. If a field is not clearly present in the text, omit it from the response.',
+							'You extract structured data from German Impressum (legal notice) texts. Return a JSON object with ONLY the fields you can confidently identify in the text. Do NOT guess, invent, or hallucinate values. If a field is not clearly present in the text, omit it from the response. Fields marked as "array" must be returned as JSON arrays of strings, even if there is only one value.',
 					},
 					{
 						role: 'user',
@@ -901,6 +1309,92 @@ async function callOpenAi(
 	} catch {
 		return null;
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Directory Homepage Link Extraction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function extractHomepageLinkFromDirectory(html: string, directoryUrl: string): string | null {
+	let directoryHostname: string;
+	try {
+		directoryHostname = new URL(directoryUrl).hostname;
+	} catch { return null; }
+
+	const candidates: Array<{ url: string; score: number }> = [];
+
+	const isExcludedHost = (hostname: string): boolean =>
+		EXCLUDED_DOMAINS.some((d) => hostname.includes(d));
+
+	// Strategy 1: <a> tags with "website"/"homepage"/"webseite" in text, aria-label, or title
+	const linkRegex = /<a\s[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+	let match;
+	while ((match = linkRegex.exec(html)) !== null) {
+		const href = match[1].trim();
+		const fullTag = match[0];
+		const linkText = match[2].replace(/<[^>]+>/g, '').trim();
+
+		if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) continue;
+		try {
+			const resolved = new URL(href, directoryUrl);
+			if (resolved.hostname === directoryHostname) continue;
+			if (isExcludedHost(resolved.hostname)) continue;
+
+			// Primary signal: link text or attributes must indicate "website"
+			let primaryScore = 0;
+			const textLower = linkText.toLowerCase();
+
+			if (/\b(zur\s+website|zur\s+homepage|webseite\s+besuchen|website\s+besuchen|visit\s+website)\b/i.test(textLower)) primaryScore = 15;
+			else if (/\b(website|webseite|homepage|internetseite)\b/i.test(textLower)) primaryScore = 10;
+
+			if (/(?:aria-label|title)\s*=\s*["'][^"']*(?:website|webseite|homepage)[^"']*["']/i.test(fullTag)) primaryScore = Math.max(primaryScore, 10);
+
+			// itemprop="url" on directory pages is a strong signal for the company's website
+			if (/itemprop\s*=\s*["']url["']/i.test(fullTag)) primaryScore = Math.max(primaryScore, 12);
+
+			// Only consider links that have a primary "website" signal
+			if (primaryScore > 0) {
+				let bonus = 0;
+				if (/target\s*=\s*["']_blank["']/i.test(fullTag)) bonus += 3;
+				if (/rel\s*=\s*["'][^"']*nofollow[^"']*["']/i.test(fullTag)) bonus += 2;
+				if (/^https?:\/\//i.test(href)) bonus += 3;
+				try {
+					if (new URL(href, directoryUrl).pathname === '/') bonus += 5;
+				} catch { /* skip */ }
+
+				candidates.push({ url: resolved.href, score: primaryScore + bonus });
+			}
+		} catch { /* skip invalid */ }
+	}
+
+	// Strategy 2: schema.org structured data (JSON-LD, microdata)
+	const schemaMatches = html.matchAll(/"(?:url|website|sameAs)"\s*:\s*"(https?:\/\/[^"]+)"/gi);
+	for (const m of schemaMatches) {
+		try {
+			const u = new URL(m[1]);
+			if (u.hostname !== directoryHostname && !isExcludedHost(u.hostname)) {
+				candidates.push({ url: u.href, score: 8 });
+			}
+		} catch { /* skip */ }
+	}
+
+	// Strategy 3: Plain text patterns like "Website: www.example.de"
+	const text = htmlToText(html);
+	const textPattern = /(?:Website|Webseite|Homepage|Internet)\s*[:]\s*((?:https?:\/\/)?(?:www\.)?[\w.-]+\.\w{2,}(?:\/\S*)?)/gi;
+	let textMatch;
+	while ((textMatch = textPattern.exec(text)) !== null) {
+		let url = textMatch[1].trim();
+		if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+		try {
+			const u = new URL(url);
+			if (u.hostname !== directoryHostname && !isExcludedHost(u.hostname)) {
+				candidates.push({ url: u.href, score: 7 });
+			}
+		} catch { /* skip */ }
+	}
+
+	candidates.sort((a, b) => b.score - a.score);
+	return candidates.length > 0 ? candidates[0].url : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1049,10 +1543,10 @@ interface ImpressumResult {
 	title: string | null;
 	firstName: string | null;
 	lastName: string | null;
-	email: string | null;
-	phone: string | null;
-	fax: string | null;
-	mobile: string | null;
+	emails: string[];
+	phones: string[];
+	faxNumbers: string[];
+	mobileNumbers: string[];
 	vatId: string | null;
 	taxNumber: string | null;
 	street: string | null;
@@ -1138,6 +1632,92 @@ async function deriveSalutations(
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phone Number Normalization via OpenAI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Sends all raw phone/fax/mobile strings to OpenAI for normalization.
+ * Handles weird formats like "(0124) 23123 43 / 44" → two separate numbers.
+ */
+async function normalizePhoneNumbers(
+	ctx: IExecuteFunctions,
+	results: Array<{ job: ScrapeJob; data: ImpressumResult; text: string }>,
+	openAiKey: string,
+	model: string,
+): Promise<void> {
+	const rawNumbers: Array<{ resultIdx: number; field: 'phones' | 'faxNumbers' | 'mobileNumbers'; raw: string }> = [];
+
+	for (let i = 0; i < results.length; i++) {
+		const { data } = results[i];
+		for (const num of data.phones) rawNumbers.push({ resultIdx: i, field: 'phones', raw: num });
+		for (const num of data.faxNumbers) rawNumbers.push({ resultIdx: i, field: 'faxNumbers', raw: num });
+		for (const num of data.mobileNumbers) rawNumbers.push({ resultIdx: i, field: 'mobileNumbers', raw: num });
+	}
+
+	if (rawNumbers.length === 0) return;
+
+	const numberList = rawNumbers.map((n, i) => `${i}: ${n.raw}`).join('\n');
+
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.openai.com/v1/chat/completions',
+			headers: {
+				Authorization: `Bearer ${openAiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: {
+				model,
+				temperature: 0,
+				response_format: { type: 'json_object' },
+				messages: [
+					{
+						role: 'system',
+						content:
+							'You normalize German phone numbers. For each numbered entry:\n' +
+							'1. Split entries that contain multiple numbers (e.g. "23123 43 / 44" means two numbers sharing a prefix: the base number ending in 43 and another ending in 44).\n' +
+							'2. Format each as a clean, readable German phone number (e.g. "0124 2312343").\n' +
+							'3. Return a JSON object where each key is the entry index (as string) and the value is an array of normalized phone numbers.',
+					},
+					{
+						role: 'user',
+						content: numberList,
+					},
+				],
+			},
+			timeout: 15000,
+		});
+
+		const content = response?.choices?.[0]?.message?.content;
+		if (!content) return;
+
+		const mapping: Record<string, string[]> = JSON.parse(content);
+
+		// Clear and rebuild arrays per result
+		for (const result of results) {
+			result.data.phones = [];
+			result.data.faxNumbers = [];
+			result.data.mobileNumbers = [];
+		}
+
+		for (let i = 0; i < rawNumbers.length; i++) {
+			const { resultIdx, field } = rawNumbers[i];
+			const normalized = mapping[String(i)];
+			if (Array.isArray(normalized)) {
+				results[resultIdx].data[field].push(
+					...normalized.filter((n) => typeof n === 'string' && n.length > 0),
+				);
+			} else {
+				// Fallback: keep original
+				results[resultIdx].data[field].push(rawNumbers[i].raw);
+			}
+		}
+	} catch {
+		// Phone normalization is best-effort
+	}
+}
+
 function extractImpressumData(
 	html: string,
 	fullText: string,
@@ -1159,10 +1739,10 @@ function extractImpressumData(
 		title: person.title,
 		firstName: person.firstName,
 		lastName: person.lastName,
-		email: extractEmail(html, business),
-		phone: extractPhone(business),
-		fax: extractFax(business),
-		mobile: extractMobile(business),
+		emails: extractEmails(html, business),
+		phones: extractPhones(business),
+		faxNumbers: extractFaxNumbers(business),
+		mobileNumbers: extractMobileNumbers(business),
 		vatId: extractVatId(section),
 		taxNumber: extractTaxNumber(section),
 		street: address.street,
@@ -1452,44 +2032,61 @@ function normalizeEmail(email: string): string {
 		.trim();
 }
 
-function extractEmail(html: string, businessText: string): string | null {
+function extractEmails(html: string, businessText: string): string[] {
+	const found: string[] = [];
+	const seen = new Set<string>();
+
+	const addEmail = (email: string) => {
+		const normalized = email.toLowerCase().trim();
+		if (!seen.has(normalized) && !isChamberEmail(normalized)) {
+			seen.add(normalized);
+			found.push(email.trim());
+		}
+	};
+
 	const htmlLower = html.toLowerCase();
 	let impressumStart = htmlLower.indexOf('impressum');
 	if (impressumStart === -1) impressumStart = 0;
 	const impressumHtml = html.substring(impressumStart);
 
-	const mailtoMatch = impressumHtml.match(/mailto:([^\s"'<>?]+)/i);
-	if (mailtoMatch) {
-		const email = mailtoMatch[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.');
-		if (!isChamberEmail(email)) return email;
+	// mailto links in impressum section
+	const mailtoRegex = /mailto:([^\s"'<>?]+)/gi;
+	let match;
+	while ((match = mailtoRegex.exec(impressumHtml)) !== null) {
+		addEmail(match[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.'));
 	}
 
+	// Obfuscated patterns
 	const obfuscatedPatterns = [
-		/[\w.-]+\s*\(a\)\s*[\w.-]+\.\w{2,}/i,
-		/[\w.-]+\s*\[at\]\s*[\w.-]+\.\w{2,}/i,
-		/[\w.-]+\s*\(at\)\s*[\w.-]+\.\w{2,}/i,
+		/[\w.-]+\s*\(a\)\s*[\w.-]+\.\w{2,}/gi,
+		/[\w.-]+\s*\[at\]\s*[\w.-]+\.\w{2,}/gi,
+		/[\w.-]+\s*\(at\)\s*[\w.-]+\.\w{2,}/gi,
 	];
 	for (const p of obfuscatedPatterns) {
-		const m = businessText.match(p);
-		if (m) {
-			const email = m[0]
+		while ((match = p.exec(businessText)) !== null) {
+			const email = match[0]
 				.replace(/\s*\(a\)\s*/gi, '@')
 				.replace(/\s*\[at\]\s*/gi, '@')
 				.replace(/\s*\(at\)\s*/gi, '@');
-			if (!isChamberEmail(email)) return email;
+			addEmail(email);
 		}
 	}
 
+	// Standard email regex
 	const emailRegex = /[\w.-]+@[\w.-]+\.\w{2,}/g;
-	let emailMatch;
-	while ((emailMatch = emailRegex.exec(businessText)) !== null) {
-		if (!isChamberEmail(emailMatch[0])) return emailMatch[0];
+	while ((match = emailRegex.exec(businessText)) !== null) {
+		addEmail(match[0]);
 	}
 
-	const fallback = html.match(/mailto:([^\s"'<>?]+)/i);
-	if (fallback) return fallback[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.');
+	// Fallback: all mailto in full HTML
+	if (found.length === 0) {
+		const fallbackRegex = /mailto:([^\s"'<>?]+)/gi;
+		while ((match = fallbackRegex.exec(html)) !== null) {
+			addEmail(match[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.'));
+		}
+	}
 
-	return null;
+	return found;
 }
 
 function isChamberEmail(email: string): boolean {
@@ -1507,34 +2104,48 @@ function isChamberEmail(email: string): boolean {
 	return chamberDomains.some((d) => email.toLowerCase().includes(d));
 }
 
-function extractPhone(businessText: string): string | null {
+function extractPhones(businessText: string): string[] {
+	const found: string[] = [];
 	const patterns = [
-		/(?:Tel(?:efon)?|Phone|Fon)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/i,
-		/(?:Tel(?:efon)?|Phone|Fon)\s+([+\d][\d\s/\-().]+\d)/i,
-		/T\s*[.:]\s*([+\d][\d\s/\-().]+\d)/,
+		/(?:Tel(?:efon)?|Phone|Fon)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/gi,
+		/(?:Tel(?:efon)?|Phone|Fon)\s+([+\d][\d\s/\-().]+\d)/gi,
+		/T\s*[.:]\s*([+\d][\d\s/\-().]+\d)/g,
 	];
 	for (const p of patterns) {
-		const m = businessText.match(p);
-		if (m) return m[1].trim();
+		let m;
+		while ((m = p.exec(businessText)) !== null) {
+			const raw = m[1].trim();
+			if (!found.includes(raw)) found.push(raw);
+		}
 	}
-	return null;
+	return found;
 }
 
-function extractFax(businessText: string): string | null {
+function extractFaxNumbers(businessText: string): string[] {
+	const found: string[] = [];
 	const patterns = [
-		/(?:Fax|Telefax)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/i,
-		/(?:Fax|Telefax)\s+([+\d][\d\s/\-().]+\d)/i,
+		/(?:Fax|Telefax)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/gi,
+		/(?:Fax|Telefax)\s+([+\d][\d\s/\-().]+\d)/gi,
 	];
 	for (const p of patterns) {
-		const m = businessText.match(p);
-		if (m) return m[1].trim();
+		let m;
+		while ((m = p.exec(businessText)) !== null) {
+			const raw = m[1].trim();
+			if (!found.includes(raw)) found.push(raw);
+		}
 	}
-	return null;
+	return found;
 }
 
-function extractMobile(businessText: string): string | null {
-	const m = businessText.match(/(?:Mobil|Handy|Mobile)\s*[.:]\s*([+\d][\d\s/\-().]+\d)/i);
-	return m ? m[1].trim() : null;
+function extractMobileNumbers(businessText: string): string[] {
+	const found: string[] = [];
+	const regex = /(?:Mobil|Handy|Mobile)\s*[.:]\s*([+\d][\d\s/\-().]+\d)/gi;
+	let m;
+	while ((m = regex.exec(businessText)) !== null) {
+		const raw = m[1].trim();
+		if (!found.includes(raw)) found.push(raw);
+	}
+	return found;
 }
 
 function extractVatId(section: string): string | null {
@@ -1700,4 +2311,120 @@ function extractManagingDirector(businessText: string): string | null {
 		}
 	}
 	return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Domain Guessing (OpenAI + verification)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Asks OpenAI to guess likely domain names for a German company.
+ * Returns an array of domain guesses (e.g. ["zahnarzt-mueller.de", "praxis-mueller-berlin.de"]).
+ */
+async function guessDomains(
+	ctx: IExecuteFunctions,
+	companyName: string,
+	city: string,
+	openAiKey: string,
+	model: string,
+): Promise<string[]> {
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.openai.com/v1/chat/completions',
+			headers: {
+				Authorization: `Bearer ${openAiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: {
+				model,
+				temperature: 0.3,
+				messages: [
+					{
+						role: 'system',
+						content:
+							'You are a German business website domain guesser. Given a company name and city, guess the most likely website domains. German businesses typically use patterns like:\n' +
+							'- company-name.de (e.g. "lange-und-rakhimov.de")\n' +
+							'- company-name-city.de (e.g. "zahnarzt-roeder-dresden.de")\n' +
+							'- zahnarztpraxis-lastname.de\n' +
+							'- zahnarzt-lastname.de\n' +
+							'- praxis-lastname.de\n\n' +
+							'Rules:\n' +
+							'- Umlauts are transliterated: ä→ae, ö→oe, ü→ue, ß→ss\n' +
+							'- Spaces and special chars become hyphens\n' +
+							'- Drop academic titles like "Dr." or "Prof." OR keep them (try both)\n' +
+							'- Try .de domain\n' +
+							'- Return ONLY a JSON array of up to 8 domain guesses, most likely first\n' +
+							'- No explanations, just the JSON array',
+					},
+					{
+						role: 'user',
+						content: `Company: ${companyName}\nCity: ${city}`,
+					},
+				],
+			},
+			timeout: 15000,
+		});
+
+		const content = response?.choices?.[0]?.message?.content?.trim();
+		if (!content) return [];
+
+		const jsonMatch = content.match(/\[[\s\S]*\]/);
+		if (jsonMatch) {
+			const parsed = JSON.parse(jsonMatch[0]);
+			if (Array.isArray(parsed)) {
+				return parsed.filter((d: unknown) => typeof d === 'string' && d.length > 0);
+			}
+		}
+		return [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Checks if a domain exists by sending a HEAD request.
+ * Returns true if the server responds (any 2xx/3xx status).
+ */
+async function domainExists(
+	ctx: IExecuteFunctions,
+	domain: string,
+	timeout: number,
+): Promise<boolean> {
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'HEAD',
+			url: `https://${domain}`,
+			headers: {
+				'User-Agent': USER_AGENT,
+			},
+			returnFullResponse: true,
+			timeout: Math.min(timeout, 8000),
+			ignoreHttpStatusErrors: true,
+		});
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const fullResp = response as any;
+		return fullResp.statusCode >= 200 && fullResp.statusCode < 400;
+	} catch {
+		// Try HTTP as fallback
+		try {
+			const response = await ctx.helpers.httpRequest({
+				method: 'HEAD',
+				url: `http://${domain}`,
+				headers: {
+					'User-Agent': USER_AGENT,
+				},
+				returnFullResponse: true,
+				timeout: Math.min(timeout, 8000),
+				ignoreHttpStatusErrors: true,
+			});
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const fullResp = response as any;
+			return fullResp.statusCode >= 200 && fullResp.statusCode < 400;
+		} catch {
+			return false;
+		}
+	}
 }
