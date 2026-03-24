@@ -726,8 +726,10 @@ export class ImpressumScraper implements INodeType {
 					const indices = urlToJobIdx.get(url) || [];
 					for (const idx of indices) {
 						const { job, data } = jsRefetchJobs[idx];
+						let jsDomain: string | undefined;
+						try { jsDomain = new URL(job.normalizedUrl).hostname.replace(/^www\./, ''); } catch { /* ignore */ }
 						const jsText = htmlToText(result.html);
-						const jsEmails = extractEmails(result.html, jsText);
+						const jsEmails = extractEmails(result.html, jsText, jsDomain);
 						if (jsEmails.length > 0) {
 							data.emails = jsEmails;
 							// Update stored HTML so later phases benefit too
@@ -1875,6 +1877,11 @@ function extractImpressumData(
 	const address = extractAddress(business);
 	const registration = extractRegistration(section);
 
+	let siteDomain: string | undefined;
+	try {
+		siteDomain = new URL(sourceUrl || impressumUrl).hostname.replace(/^www\./, '');
+	} catch { /* ignore */ }
+
 	return {
 		sourceUrl,
 		impressumUrl,
@@ -1883,7 +1890,7 @@ function extractImpressumData(
 		title: person.title,
 		firstName: person.firstName,
 		lastName: person.lastName,
-		emails: extractEmails(html, business),
+		emails: extractEmails(html, business, siteDomain),
 		phones: extractPhones(business),
 		faxNumbers: extractFaxNumbers(business),
 		mobileNumbers: extractMobileNumbers(business),
@@ -2176,15 +2183,27 @@ function normalizeEmail(email: string): string {
 		.trim();
 }
 
-function extractEmails(html: string, businessText: string): string[] {
+function extractEmails(html: string, businessText: string, siteDomain?: string): string[] {
 	const found: string[] = [];
 	const seen = new Set<string>();
 
+	/** Try to deobfuscate a placeholder email by replacing its domain with the site domain. */
+	const deobfuscate = (email: string): string => {
+		if (!siteDomain) return email;
+		const lower = email.toLowerCase().trim();
+		if (isPlaceholderEmail(lower)) {
+			const localPart = lower.split('@')[0];
+			return `${localPart}@${siteDomain}`;
+		}
+		return email;
+	};
+
 	const addEmail = (email: string) => {
-		const normalized = email.toLowerCase().trim();
+		const resolved = deobfuscate(email);
+		const normalized = resolved.toLowerCase().trim();
 		if (!seen.has(normalized) && !isChamberEmail(normalized) && !isPlaceholderEmail(normalized)) {
 			seen.add(normalized);
-			found.push(email.trim());
+			found.push(resolved.trim());
 		}
 	};
 
