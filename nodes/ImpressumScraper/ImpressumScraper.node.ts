@@ -1358,9 +1358,11 @@ async function enrichWithOpenAi(
 				for (const field of allFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
 						if (ARRAY_FIELDS.has(field)) {
-							data[field] = Array.isArray(extracted[field])
+							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
 								: [String(extracted[field])];
+							if (field === 'emails') arr = arr.filter((e) => !isPlaceholderEmail(e.toLowerCase()));
+							data[field] = arr;
 						} else {
 							data[field] = String(extracted[field]);
 						}
@@ -1393,9 +1395,11 @@ async function enrichWithOpenAi(
 				for (const field of missingFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
 						if (ARRAY_FIELDS.has(field) && (data[field] as unknown[]).length === 0) {
-							data[field] = Array.isArray(extracted[field])
+							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
 								: [String(extracted[field])];
+							if (field === 'emails') arr = arr.filter((e) => !isPlaceholderEmail(e.toLowerCase()));
+							data[field] = arr;
 						} else if (!ARRAY_FIELDS.has(field) && data[field] === null) {
 							data[field] = String(extracted[field]);
 						}
