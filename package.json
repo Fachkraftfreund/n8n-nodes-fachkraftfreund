@@ -26,13 +26,15 @@
       "dist/credentials/RingoverApi.credentials.js",
       "dist/credentials/ApifyApi.credentials.js",
       "dist/credentials/OpenAiApi.credentials.js",
-      "dist/credentials/SearchApi.credentials.js"
+      "dist/credentials/SearchApi.credentials.js",
+      "dist/credentials/BullhornApi.credentials.js"
     ],
     "nodes": [
       "dist/nodes/WaliChat/WaliChat.node.js",
       "dist/nodes/WaliChatFirstContacts/WaliChatFirstContacts.node.js",
       "dist/nodes/Ringover/Ringover.node.js",
-      "dist/nodes/ImpressumScraper/ImpressumScraper.node.js"
+      "dist/nodes/ImpressumScraper/ImpressumScraper.node.js",
+      "dist/nodes/TeamKpiTracker/TeamKpiTracker.node.js"
     ]
   },
   "devDependencies": {
