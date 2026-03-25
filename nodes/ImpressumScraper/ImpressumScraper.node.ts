@@ -2249,6 +2249,34 @@ function normalizeEmail(email: string): string {
 		.trim();
 }
 
+/** Basic sanity check that a string looks like a real email address. */
+function isValidEmail(email: string): boolean {
+	// Must contain exactly one @
+	const parts = email.split('@');
+	if (parts.length !== 2) return false;
+	const [local, domain] = parts;
+	if (!local || !domain) return false;
+	// Reject URL-encoding leftovers (%20, %40, etc.)
+	if (/%[0-9A-Fa-f]{2}/.test(email)) return false;
+	// Reject retina image filenames like image@2x.png, icon@4x.webp
+	if (/^.+@\d+x\.\w+$/.test(email)) return false;
+	// Local part: only word chars, dots, hyphens, plus signs
+	if (!/^[\w.+\-]+$/.test(local)) return false;
+	// Domain: must have at least one dot, only word chars, dots, hyphens
+	if (!/^[\w.-]+\.\w{2,}$/.test(domain)) return false;
+	return true;
+}
+
+/** Clean up a raw email extracted from a mailto: href. */
+function cleanMailtoEmail(raw: string): string {
+	let email = raw;
+	// Decode common URL-encoded characters
+	try { email = decodeURIComponent(email); } catch { /* keep as-is */ }
+	// Strip HTML entities
+	email = email.replace(/&#64;/g, '@').replace(/&#46;/g, '.');
+	return email.trim();
+}
+
 function extractEmails(html: string, businessText: string, siteDomain?: string): string[] {
 	const found: string[] = [];
 	const seen = new Set<string>();
@@ -2267,7 +2295,12 @@ function extractEmails(html: string, businessText: string, siteDomain?: string):
 	const addEmail = (email: string) => {
 		const resolved = deobfuscate(email);
 		const normalized = resolved.toLowerCase().trim();
-		if (!seen.has(normalized) && !isChamberEmail(normalized) && !isPlaceholderEmail(normalized)) {
+		if (
+			!seen.has(normalized) &&
+			!isChamberEmail(normalized) &&
+			!isPlaceholderEmail(normalized) &&
+			isValidEmail(normalized)
+		) {
 			seen.add(normalized);
 			found.push(resolved.trim());
 		}
@@ -2282,7 +2315,7 @@ function extractEmails(html: string, businessText: string, siteDomain?: string):
 	const mailtoRegex = /mailto:([^\s"'<>?]+)/gi;
 	let match;
 	while ((match = mailtoRegex.exec(impressumHtml)) !== null) {
-		addEmail(match[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.'));
+		addEmail(cleanMailtoEmail(match[1]));
 	}
 
 	// Obfuscated patterns
@@ -2311,7 +2344,7 @@ function extractEmails(html: string, businessText: string, siteDomain?: string):
 	if (found.length === 0) {
 		const fallbackRegex = /mailto:([^\s"'<>?]+)/gi;
 		while ((match = fallbackRegex.exec(html)) !== null) {
-			addEmail(match[1].replace(/&#64;/g, '@').replace(/&#46;/g, '.'));
+			addEmail(cleanMailtoEmail(match[1]));
 		}
 	}
 

@@ -823,24 +823,38 @@ async function fetchRingoverKpis(
 	const allKeys = ringoverGetAllApiKeys(credentials);
 
 	// Fetch all calls from all keys in parallel (with pagination per key)
+	// Deduplicate by call_id since multiple keys in the same account see
+	// the same calls.
 	const keyPromises = allKeys.map((key) =>
 		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate),
 	);
 	const keyResults = await Promise.all(keyPromises);
-	const allCalls = keyResults.flat();
+	const seenCallIds = new Set<string>();
+	const allCalls: IDataObject[] = [];
+	for (const calls of keyResults) {
+		for (const call of calls) {
+			const callId = call.call_id as string;
+			if (callId && !seenCallIds.has(callId)) {
+				seenCallIds.add(callId);
+				allCalls.push(call);
+			}
+		}
+	}
 
-	// Count outbound calls
+	// Count outbound calls (Ringover uses "out" for direction)
 	const outboundCalls = allCalls.filter((call) => {
-		const direction = ((call.direction as string) || '').toUpperCase();
-		return direction === 'OUTBOUND';
+		const direction = ((call.direction as string) || '').toLowerCase();
+		return direction === 'out';
 	});
 
 	const callsMade = outboundCalls.length;
 
-	// Count calls where someone picked up (duration > 30 seconds)
+	// Count calls where someone picked up: is_answered === true AND
+	// incall_duration > 30 seconds (actual conversation time)
 	const callsAnswered = outboundCalls.filter((call) => {
-		const duration = (call.duration as number) ?? 0;
-		return duration > 30;
+		if (call.is_answered !== true) return false;
+		const incallDuration = (call.incall_duration as number) ?? 0;
+		return incallDuration > 30;
 	}).length;
 
 	return { callsMade, callsAnswered };
