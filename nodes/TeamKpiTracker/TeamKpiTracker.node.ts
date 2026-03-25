@@ -98,6 +98,13 @@ export class TeamKpiTracker implements INodeType {
 					show: { enableBullhorn: [true] },
 				},
 			},
+			{
+				name: 'ringoverApi',
+				required: false,
+				displayOptions: {
+					show: { enableRingover: [true] },
+				},
+			},
 		],
 		properties: [
 			// ----------------------------------
@@ -918,18 +925,31 @@ async function fetchRingoverKpis(
 	labelToGroup: Record<string, string>,
 	outputGroups: string[],
 ): Promise<RingoverKpiResult> {
-	// Read Ringover API keys from node property (one per line)
-	const keysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
-	const allKeys = keysStr
-		.split('\n')
-		.map((k) => k.trim())
-		.filter((k) => k.length > 0);
+	// Read API keys and region from credential
+	const credentials = await this.getCredentials('ringoverApi');
+	const primaryKey = (credentials.apiKey as string) || '';
+	const additionalKeysStr = (credentials.additionalApiKeys as string) || '';
+	const region = (credentials.region as string) || 'eu';
 
-	if (allKeys.length === 0) {
-		throw new Error('No Ringover API keys configured');
+	const allKeys = [
+		primaryKey,
+		...additionalKeysStr.split('\n').map((k) => k.trim()),
+	].filter((k) => k.length > 0);
+
+	// Also include keys from the legacy node parameter if present
+	const legacyKeysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
+	const legacyKeys = legacyKeysStr.split('\n').map((k) => k.trim()).filter((k) => k.length > 0);
+	for (const k of legacyKeys) {
+		if (!allKeys.includes(k)) allKeys.push(k);
 	}
 
-	const baseUrl = 'https://public-api.ringover.com/v2';
+	if (allKeys.length === 0) {
+		throw new Error('No Ringover API keys configured. Add them in the Ringover credential.');
+	}
+
+	const baseUrl = region === 'us'
+		? 'https://public-api-us.ringover.com/v2'
+		: 'https://public-api.ringover.com/v2';
 
 	// Fetch all calls from all keys in parallel (with pagination per key)
 	// Deduplicate by call_id since multiple keys in the same account see
