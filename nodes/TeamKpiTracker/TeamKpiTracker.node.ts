@@ -1,14 +1,13 @@
 import type {
 	IExecuteFunctions,
-	ILoadOptionsFunctions,
 	INodeExecutionData,
-	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 	IDataObject,
 	IHttpRequestOptions,
 } from 'n8n-workflow';
 import { NodeOperationError } from 'n8n-workflow';
+import { getOpenAiModels } from '../shared/openai-models';
 
 const WALICHAT_BASE_URL = 'https://api.wali.chat/v1';
 const WALICHAT_PAGE_SIZE = 200;
@@ -220,48 +219,7 @@ export class TeamKpiTracker implements INodeType {
 
 	methods = {
 		loadOptions: {
-			async getOpenAiModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
-				const FALLBACK: INodePropertyOptions[] = [
-					{ name: 'gpt-4.1-nano', value: 'gpt-4.1-nano' },
-					{ name: 'gpt-4.1-mini', value: 'gpt-4.1-mini' },
-					{ name: 'gpt-4.1', value: 'gpt-4.1' },
-					{ name: 'gpt-4o-mini', value: 'gpt-4o-mini' },
-					{ name: 'gpt-4o', value: 'gpt-4o' },
-					{ name: 'o3-mini', value: 'o3-mini' },
-					{ name: 'o4-mini', value: 'o4-mini' },
-				];
-
-				// Read key from node property
-				const apiKey = this.getCurrentNodeParameter('openAiApiKey') as string;
-				if (!apiKey) return FALLBACK;
-
-				try {
-					const response = await this.helpers.httpRequest({
-						method: 'GET',
-						url: 'https://api.openai.com/v1/models',
-						headers: { Authorization: `Bearer ${apiKey}` },
-						timeout: 10000,
-					});
-
-					const EXCLUDE =
-						/audio|image|realtime|tts|transcribe|instruct|search|codex|computer|embedding|moderation|dall-e|sora|whisper|babbage|davinci|chatgpt/i;
-					const SKIP_VARIANT = /\d{4}-\d{2}-\d{2}|-\d{3,4}(-|$)|-preview|-16k|-chat-latest/;
-
-					const models: INodePropertyOptions[] = (response?.data || [])
-						.map((m: { id: string }) => m.id)
-						.filter((id: string) => {
-							if (EXCLUDE.test(id)) return false;
-							if (SKIP_VARIANT.test(id)) return false;
-							return /^(gpt-|o[134])/.test(id);
-						})
-						.sort((a: string, b: string) => a.localeCompare(b))
-						.map((id: string) => ({ name: id, value: id }));
-
-					return models.length > 0 ? models : FALLBACK;
-				} catch {
-					return FALLBACK;
-				}
-			},
+			getOpenAiModels,
 		},
 	};
 
@@ -969,15 +927,21 @@ async function bullhornAuthenticate(
 		: 'rest.bullhornstaffing.com';
 
 	// Step 2: Get authorization code
+	// Use a non-resolving redirect_uri so that Bullhorn redirects to it with
+	// the auth code in the URL. n8n's httpRequest follows redirects, which
+	// would consume the code. By redirecting to a dead endpoint, the request
+	// fails and the error message/URL contains the code we need.
+	const redirectUri = 'https://localhost/bullhorn-oauth-callback';
 	const authorizeUrl =
 		`https://${authHost}/oauth/authorize` +
 		`?client_id=${encodeURIComponent(clientId)}` +
 		`&response_type=code` +
 		`&action=Login` +
+		`&redirect_uri=${encodeURIComponent(redirectUri)}` +
 		`&username=${encodeURIComponent(username)}` +
 		`&password=${encodeURIComponent(password)}`;
 
-	let authCode: string;
+	let authCode: string | undefined;
 	try {
 		const authResp = (await this.helpers.httpRequest({
 			method: 'GET',
@@ -991,29 +955,27 @@ async function bullhornAuthenticate(
 		const codeMatch = respStr.match(/code=([^&"'\s]+)/);
 		if (codeMatch) {
 			authCode = codeMatch[1];
-		} else {
-			const respObj =
-				typeof authResp === 'object' ? authResp : {};
-			if (respObj.authorizationCode) {
-				authCode = respObj.authorizationCode as string;
-			} else {
-				throw new Error(
-					'Could not extract authorization code from Bullhorn response',
-				);
-			}
+		} else if (typeof authResp === 'object' && authResp.authorizationCode) {
+			authCode = authResp.authorizationCode as string;
 		}
 	} catch (error) {
-		const errMsg = (error as Error).message || '';
+		// Expected: the redirect to localhost fails, but the error/URL contains the code
+		const errMsg = (error as Error).message || String(error);
 		const codeMatch = errMsg.match(/code=([^&"'\s]+)/);
 		if (codeMatch) {
 			authCode = codeMatch[1];
-		} else {
-			throw new NodeOperationError(
-				this.getNode(),
-				`Bullhorn authorization failed: ${errMsg}`,
-			);
 		}
 	}
+
+	if (!authCode) {
+		throw new NodeOperationError(
+			this.getNode(),
+			'Bullhorn authorization failed: Could not extract authorization code',
+		);
+	}
+
+	// URL-decode the auth code (Bullhorn encodes the colon as %3A)
+	authCode = decodeURIComponent(authCode);
 
 	// Step 3: Exchange code for access token
 	const tokenResp = (await this.helpers.httpRequest({
