@@ -944,11 +944,16 @@ async function bullhornAuthenticate(
 		simple: false,
 	});
 
-	// Extract code from Location header
+	// Extract code from Location header using URL parsing (auto-decodes %3A etc.)
 	const location = authResp.headers?.location || '';
 	if (location) {
-		const locMatch = location.match(/code=([^&]+)/);
-		if (locMatch) authCode = locMatch[1];
+		try {
+			const locUrl = new URL(location);
+			authCode = locUrl.searchParams.get('code') || undefined;
+		} catch {
+			const locMatch = location.match(/code=([^&]+)/);
+			if (locMatch) authCode = decodeURIComponent(locMatch[1]);
+		}
 	}
 
 	// Fallback: check body
@@ -957,7 +962,7 @@ async function bullhornAuthenticate(
 			? authResp.body
 			: JSON.stringify(authResp.body);
 		const bodyMatch = bodyStr.match(/code=([^&"'\s]+)/);
-		if (bodyMatch) authCode = bodyMatch[1];
+		if (bodyMatch) authCode = decodeURIComponent(bodyMatch[1]);
 	}
 
 	if (!authCode) {
@@ -975,16 +980,24 @@ async function bullhornAuthenticate(
 		`&client_id=${encodeURIComponent(clientId)}` +
 		`&client_secret=${encodeURIComponent(clientSecret)}`;
 
-	const tokenResp = (await this.helpers.httpRequest({
-		method: 'POST',
-		url: tokenUrl,
-	})) as IDataObject;
+	let tokenResp: IDataObject;
+	try {
+		tokenResp = (await this.helpers.httpRequest({
+			method: 'POST',
+			url: tokenUrl,
+		})) as IDataObject;
+	} catch (error) {
+		throw new NodeOperationError(
+			this.getNode(),
+			`Bullhorn token exchange failed: ${(error as Error).message}`,
+		);
+	}
 
 	const accessToken = tokenResp.access_token as string;
 	if (!accessToken) {
 		throw new NodeOperationError(
 			this.getNode(),
-			'Bullhorn token exchange failed: no access_token returned',
+			`Bullhorn token exchange failed: ${JSON.stringify(tokenResp)}`,
 		);
 	}
 
