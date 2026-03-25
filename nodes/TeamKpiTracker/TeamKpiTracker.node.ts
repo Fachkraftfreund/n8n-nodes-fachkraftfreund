@@ -868,6 +868,7 @@ async function fetchAllCallsForKey(
 	// Split into 14-day chunks
 	let chunkStart = startDate.getTime();
 	const endMs = endDate.getTime();
+	let firstRequest = true;
 
 	while (chunkStart < endMs) {
 		const chunkEnd = Math.min(chunkStart + RINGOVER_MAX_RANGE_MS, endMs);
@@ -885,9 +886,14 @@ async function fetchAllCallsForKey(
 			let resp: IDataObject;
 			try {
 				resp = await ringoverRequest(ctx, apiKey, baseUrl, 'GET', '/calls', undefined, qs);
-			} catch {
+			} catch (error) {
+				// Let the first request error propagate so the user sees what went wrong
+				// (e.g. auth failure, wrong URL). Only swallow errors on subsequent pages
+				// where we already have partial data.
+				if (firstRequest) throw error;
 				break;
 			}
+			firstRequest = false;
 
 			const callList = (resp as IDataObject)?.call_list;
 			if (Array.isArray(callList) && callList.length > 0) {
