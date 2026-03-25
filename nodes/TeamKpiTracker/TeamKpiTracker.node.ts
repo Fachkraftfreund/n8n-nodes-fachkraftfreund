@@ -80,16 +80,22 @@ export class TeamKpiTracker implements INodeType {
 				required: true,
 			},
 			{
-				name: 'bullhornApi',
-				required: false,
-			},
-			{
 				name: 'openAiApi',
 				required: false,
 			},
 			{
 				name: 'ringoverApi',
 				required: false,
+				displayOptions: {
+					show: { enableRingover: [true] },
+				},
+			},
+			{
+				name: 'bullhornApi',
+				required: false,
+				displayOptions: {
+					show: { enableBullhorn: [true] },
+				},
 			},
 		],
 		properties: [
