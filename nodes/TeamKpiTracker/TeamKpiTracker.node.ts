@@ -841,7 +841,7 @@ async function fetchChatInboundText(
 
 async function ringoverRequest(
 	ctx: IExecuteFunctions,
-	apiKey: string,
+	apiKey: string | null,
 	baseUrl: string,
 	method: string,
 	path: string,
@@ -851,10 +851,19 @@ async function ringoverRequest(
 	const options: IHttpRequestOptions = {
 		method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
 		url: `${baseUrl}${path}`,
-		headers: { Authorization: apiKey },
 		qs: qs as Record<string, string>,
 		body,
 	};
+	// Use credential-based auth for the primary key (null),
+	// manual Authorization header for additional keys
+	if (apiKey === null) {
+		return ctx.helpers.httpRequestWithAuthentication.call(
+			ctx,
+			'ringoverApi',
+			options,
+		) as Promise<IDataObject>;
+	}
+	options.headers = { Authorization: apiKey };
 	return ctx.helpers.httpRequest(options) as Promise<IDataObject>;
 }
 
@@ -865,7 +874,7 @@ const RINGOVER_MAX_RANGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 async function fetchAllCallsForKey(
 	ctx: IExecuteFunctions,
-	apiKey: string,
+	apiKey: string | null,
 	baseUrl: string,
 	startDate: Date,
 	endDate: Date,
@@ -925,26 +934,22 @@ async function fetchRingoverKpis(
 	labelToGroup: Record<string, string>,
 	outputGroups: string[],
 ): Promise<RingoverKpiResult> {
-	// Read API keys and region from credential
+	// Read region and additional keys from credential
 	const credentials = await this.getCredentials('ringoverApi');
-	const primaryKey = (credentials.apiKey as string) || '';
 	const additionalKeysStr = (credentials.additionalApiKeys as string) || '';
 	const region = (credentials.region as string) || 'eu';
 
-	const allKeys = [
-		primaryKey,
-		...additionalKeysStr.split('\n').map((k) => k.trim()),
-	].filter((k) => k.length > 0);
+	// Primary key uses credential-based auth (null), additional keys use manual headers
+	const additionalKeys: string[] = additionalKeysStr
+		.split('\n')
+		.map((k) => k.trim())
+		.filter((k) => k.length > 0);
 
 	// Also include keys from the legacy node parameter if present
 	const legacyKeysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
 	const legacyKeys = legacyKeysStr.split('\n').map((k) => k.trim()).filter((k) => k.length > 0);
 	for (const k of legacyKeys) {
-		if (!allKeys.includes(k)) allKeys.push(k);
-	}
-
-	if (allKeys.length === 0) {
-		throw new Error('No Ringover API keys configured. Add them in the Ringover credential.');
+		if (!additionalKeys.includes(k)) additionalKeys.push(k);
 	}
 
 	const baseUrl = region === 'us'
@@ -954,7 +959,9 @@ async function fetchRingoverKpis(
 	// Fetch all calls from all keys in parallel (with pagination per key)
 	// Deduplicate by call_id since multiple keys in the same account see
 	// the same calls.
-	const keyPromises = allKeys.map((key) =>
+	// Primary key (null) uses httpRequestWithAuthentication; additional keys use manual auth
+	const allKeyArgs: Array<string | null> = [null, ...additionalKeys];
+	const keyPromises = allKeyArgs.map((key) =>
 		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate),
 	);
 	const keyResults = await Promise.all(keyPromises);
