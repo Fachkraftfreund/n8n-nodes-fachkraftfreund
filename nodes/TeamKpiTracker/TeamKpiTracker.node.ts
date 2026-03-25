@@ -77,14 +77,17 @@ export class TeamKpiTracker implements INodeType {
 		credentials: [
 			{
 				name: 'waliChatApi',
+				displayName: 'WaliChat API',
 				required: true,
 			},
 			{
 				name: 'openAiApi',
+				displayName: 'OpenAI API',
 				required: false,
 			},
 			{
 				name: 'ringoverApi',
+				displayName: 'Ringover API',
 				required: false,
 				displayOptions: {
 					show: { enableRingover: [true] },
@@ -92,6 +95,7 @@ export class TeamKpiTracker implements INodeType {
 			},
 			{
 				name: 'bullhornApi',
+				displayName: 'Bullhorn API',
 				required: false,
 				displayOptions: {
 					show: { enableBullhorn: [true] },
@@ -928,13 +932,8 @@ async function fetchRingoverKpis(
 // ---------------------------------------------------------------------------
 
 function formatBullhornTimestamp(date: Date): string {
-	const y = date.getFullYear();
-	const m = String(date.getMonth() + 1).padStart(2, '0');
-	const d = String(date.getDate()).padStart(2, '0');
-	const h = String(date.getHours()).padStart(2, '0');
-	const min = String(date.getMinutes()).padStart(2, '0');
-	const s = String(date.getSeconds()).padStart(2, '0');
-	return `${y}-${m}-${d} ${h}:${min}:${s}`;
+	// Bullhorn BQL expects epoch milliseconds (unquoted) for timestamp comparisons
+	return date.getTime().toString();
 }
 
 async function bullhornAuthenticate(
@@ -1121,7 +1120,7 @@ async function fetchBullhornKpis(
 
 	// Step 1: Get JobSubmissions with status "An Kunde weitergeleitet" in period
 	const submissionWhere =
-		`status = 'An Kunde weitergeleitet' AND dateAdded >= '${startStr}' AND dateAdded <= '${endStr}'`;
+		`status = 'An Kunde weitergeleitet' AND dateAdded >= ${startStr} AND dateAdded <= ${endStr}`;
 	const submissions = await bullhornQuery.call(
 		this,
 		session,
