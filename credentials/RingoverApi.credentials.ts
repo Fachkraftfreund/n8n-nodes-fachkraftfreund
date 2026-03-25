@@ -55,7 +55,8 @@ export class RingoverApi implements ICredentialType {
 		request: {
 			baseURL:
 				'={{$credentials.region === "us" ? "https://public-api-us.ringover.com/v2" : "https://public-api.ringover.com/v2"}}',
-			url: '/teams',
+			url: '/calls',
+			qs: { limit_count: '1' },
 			method: 'GET',
 		},
 	};
