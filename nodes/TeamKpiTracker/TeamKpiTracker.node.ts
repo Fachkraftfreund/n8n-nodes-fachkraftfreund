@@ -77,25 +77,10 @@ export class TeamKpiTracker implements INodeType {
 		credentials: [
 			{
 				name: 'waliChatApi',
-				displayName: 'WaliChat API',
 				required: true,
 			},
 			{
-				name: 'openAiApi',
-				displayName: 'OpenAI API',
-				required: false,
-			},
-			{
-				name: 'ringoverApi',
-				displayName: 'Ringover API',
-				required: false,
-				displayOptions: {
-					show: { enableRingover: [true] },
-				},
-			},
-			{
 				name: 'bullhornApi',
-				displayName: 'Bullhorn API',
 				required: false,
 				displayOptions: {
 					show: { enableBullhorn: [true] },
@@ -158,6 +143,15 @@ export class TeamKpiTracker implements INodeType {
 			//         OpenAI Settings
 			// ----------------------------------
 			{
+				displayName: 'OpenAI API Key',
+				name: 'openAiApiKey',
+				type: 'string',
+				typeOptions: { password: true },
+				default: '',
+				description:
+					'Your OpenAI API key for classifying positive replies. Leave empty to skip classification.',
+			},
+			{
 				displayName: 'OpenAI Model',
 				name: 'openAiModel',
 				type: 'options',
@@ -167,7 +161,21 @@ export class TeamKpiTracker implements INodeType {
 				default: 'gpt-4.1-nano',
 				noDataExpression: true,
 				description:
-					'The OpenAI model used to classify positive replies. Only used when OpenAI credentials are configured.',
+					'The OpenAI model used to classify positive replies.',
+			},
+
+			// ----------------------------------
+			//         Ringover Settings
+			// ----------------------------------
+			{
+				displayName: 'Ringover API Keys',
+				name: 'ringoverApiKeys',
+				type: 'string',
+				typeOptions: { password: true, rows: 4 },
+				default: '',
+				displayOptions: { show: { enableRingover: [true] } },
+				description:
+					'Ringover API keys, one per line. All keys are queried and results are merged (deduplicated).',
 			},
 
 			// ----------------------------------
@@ -223,13 +231,9 @@ export class TeamKpiTracker implements INodeType {
 					{ name: 'o4-mini', value: 'o4-mini' },
 				];
 
-				let apiKey: string;
-				try {
-					const creds = await this.getCredentials('openAiApi');
-					apiKey = creds.apiKey as string;
-				} catch {
-					return FALLBACK;
-				}
+				// Read key from node property
+				const apiKey = this.getCurrentNodeParameter('openAiApiKey') as string;
+				if (!apiKey) return FALLBACK;
 
 				try {
 					const response = await this.helpers.httpRequest({
@@ -296,14 +300,8 @@ export class TeamKpiTracker implements INodeType {
 			sourceLabels,
 		);
 
-		// --- Resolve OpenAI key ---
-		let openAiKey: string | undefined;
-		try {
-			const creds = await this.getCredentials('openAiApi');
-			openAiKey = creds.apiKey as string;
-		} catch {
-			// OpenAI not configured
-		}
+		// --- Resolve OpenAI key (from node property) ---
+		const openAiKey = (this.getNodeParameter('openAiApiKey', 0, '') as string) || undefined;
 
 		// ==================== WALICHAT ====================
 		const chatsWithReplies: ChatWithReply[] = [];
@@ -806,15 +804,6 @@ async function fetchChatInboundText(
 // Ringover: Fetch call KPIs
 // ---------------------------------------------------------------------------
 
-function ringoverGetAllApiKeys(credentials: IDataObject): string[] {
-	const primary = credentials.apiKey as string;
-	const additionalStr = (credentials.additionalApiKeys as string) || '';
-	const additional = additionalStr
-		.split('\n')
-		.map((k) => k.trim())
-		.filter((k) => k.length > 0);
-	return [primary, ...additional];
-}
 
 async function ringoverRequest(
 	ctx: IExecuteFunctions,
@@ -880,14 +869,18 @@ async function fetchRingoverKpis(
 	startDate: Date,
 	endDate: Date,
 ): Promise<RingoverKpiResult> {
-	const credentials = await this.getCredentials('ringoverApi');
-	const region = (credentials.region as string) || 'eu';
-	const baseUrl =
-		region === 'us'
-			? 'https://public-api-us.ringover.com/v2'
-			: 'https://public-api.ringover.com/v2';
+	// Read Ringover API keys from node property (one per line)
+	const keysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
+	const allKeys = keysStr
+		.split('\n')
+		.map((k) => k.trim())
+		.filter((k) => k.length > 0);
 
-	const allKeys = ringoverGetAllApiKeys(credentials);
+	if (allKeys.length === 0) {
+		throw new Error('No Ringover API keys configured');
+	}
+
+	const baseUrl = 'https://public-api.ringover.com/v2';
 
 	// Fetch all calls from all keys in parallel (with pagination per key)
 	// Deduplicate by call_id since multiple keys in the same account see
