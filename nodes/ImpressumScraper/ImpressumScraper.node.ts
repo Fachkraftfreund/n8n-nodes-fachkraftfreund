@@ -2235,18 +2235,22 @@ function prioritizeEmails(
 }
 
 function normalizeEmail(email: string): string {
-	return email
+	let result = email
 		.replace(/\s*\(at\)\s*/gi, '@')
 		.replace(/\s*\[at\]\s*/gi, '@')
 		.replace(/\s*\(a\)\s*/gi, '@')
 		.replace(/\s*\{at\}\s*/gi, '@')
-		.replace(/\s*\bat\b\s*/gi, '@')
 		.replace(/&#64;/g, '@')
 		.replace(/&#46;/g, '.')
 		.replace(/\s*\(dot\)\s*/gi, '.')
 		.replace(/\s*\[dot\]\s*/gi, '.')
-		.replace(/%40/g, '@')
-		.trim();
+		.replace(/%40/g, '@');
+	// Only apply bare-word "at" → "@" when no @ is present yet,
+	// to avoid corrupting valid .at domains (e.g. ooeg.at)
+	if (!result.includes('@')) {
+		result = result.replace(/\s+at\s+/gi, '@');
+	}
+	return result.trim();
 }
 
 /** Basic sanity check that a string looks like a real email address. */

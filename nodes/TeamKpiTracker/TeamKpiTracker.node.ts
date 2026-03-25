@@ -43,15 +43,28 @@ interface ChatWithReply {
 	outputGroup: string;
 }
 
-interface BullhornKpiResult {
+interface BullhornCategoryCounts {
 	submissionsWeitergeleitet: number;
 	jobsWeitergeleitet3Plus: number;
 	jobsWeitergeleitet5Plus: number;
 }
 
+interface BullhornKpiResult {
+	submissionsWeitergeleitet: number;
+	jobsWeitergeleitet3Plus: number;
+	jobsWeitergeleitet5Plus: number;
+	bySource: Record<string, BullhornCategoryCounts>;
+}
+
+interface RingoverCategoryCounts {
+	callsMade: number;
+	callsAnswered: number;
+}
+
 interface RingoverKpiResult {
 	callsMade: number;
 	callsAnswered: number;
+	bySource: Record<string, RingoverCategoryCounts>;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,10 +307,10 @@ export class TeamKpiTracker implements INodeType {
 		}
 
 		// ==================== RINGOVER ====================
-		let ringoverResult: RingoverKpiResult = { callsMade: 0, callsAnswered: 0 };
+		let ringoverResult: RingoverKpiResult = { callsMade: 0, callsAnswered: 0, bySource: {} };
 		if (enableRingover) {
 			try {
-				ringoverResult = await fetchRingoverKpis.call(this, startDate, endDate);
+				ringoverResult = await fetchRingoverKpis.call(this, startDate, endDate, labelToGroup, outputGroups);
 			} catch (error) {
 				if (!this.continueOnFail()) {
 					throw new NodeOperationError(
@@ -313,10 +326,11 @@ export class TeamKpiTracker implements INodeType {
 			submissionsWeitergeleitet: 0,
 			jobsWeitergeleitet3Plus: 0,
 			jobsWeitergeleitet5Plus: 0,
+			bySource: {},
 		};
 		if (enableBullhorn) {
 			try {
-				bullhornResult = await fetchBullhornKpis.call(this, startDate, endDate);
+				bullhornResult = await fetchBullhornKpis.call(this, startDate, endDate, labelToGroup, outputGroups);
 			} catch (error) {
 				if (!this.continueOnFail()) {
 					throw new NodeOperationError(
@@ -327,43 +341,77 @@ export class TeamKpiTracker implements INodeType {
 			}
 		}
 
-		// ==================== BUILD OUTPUT ====================
-		const output: IDataObject = {
-			// Period info
-			date: endDate.toISOString().split('T')[0],
-			month: monthName,
-			monthNumber,
-			year,
-			periodStart: startDate.toISOString(),
-			periodEnd: endDate.toISOString(),
-
-			// WaliChat totals
-			walichat_totalFirstMessages: waliResult.totalFirstMessages,
-			walichat_totalReplied: waliResult.totalReplied,
-			walichat_totalPositiveReplies: waliResult.totalPositiveReplies,
-
-			// Ringover
-			ringover_callsMade: ringoverResult.callsMade,
-			ringover_callsAnswered: ringoverResult.callsAnswered,
-
-			// Bullhorn
-			bullhorn_submissionsWeitergeleitet: bullhornResult.submissionsWeitergeleitet,
-			bullhorn_jobsWeitergeleitet3Plus: bullhornResult.jobsWeitergeleitet3Plus,
-			bullhorn_jobsWeitergeleitet5Plus: bullhornResult.jobsWeitergeleitet5Plus,
+		// ==================== BUILD OUTPUT (nested/boxed) ====================
+		const walichatObj: IDataObject = {
+			total: {
+				firstMessages: waliResult.totalFirstMessages,
+				replied: waliResult.totalReplied,
+				positiveReplies: waliResult.totalPositiveReplies,
+			},
 		};
-
-		// WaliChat per-label breakdown
 		for (const group of outputGroups) {
-			const safeKey = group.replace(/\s+/g, '_');
 			const data = waliResult.byLabel[group] ?? {
 				firstMessages: 0,
 				replied: 0,
 				positiveReplies: 0,
 			};
-			output[`walichat_${safeKey}_firstMessages`] = data.firstMessages;
-			output[`walichat_${safeKey}_replied`] = data.replied;
-			output[`walichat_${safeKey}_positiveReplies`] = data.positiveReplies;
+			walichatObj[group] = {
+				firstMessages: data.firstMessages,
+				replied: data.replied,
+				positiveReplies: data.positiveReplies,
+			};
 		}
+
+		const ringoverObj: IDataObject = {
+			total: {
+				callsMade: ringoverResult.callsMade,
+				callsAnswered: ringoverResult.callsAnswered,
+			},
+		};
+		for (const group of outputGroups) {
+			const data = ringoverResult.bySource[group] ?? {
+				callsMade: 0,
+				callsAnswered: 0,
+			};
+			ringoverObj[group] = {
+				callsMade: data.callsMade,
+				callsAnswered: data.callsAnswered,
+			};
+		}
+
+		const bullhornObj: IDataObject = {
+			total: {
+				submissionsWeitergeleitet: bullhornResult.submissionsWeitergeleitet,
+				jobsWeitergeleitet3Plus: bullhornResult.jobsWeitergeleitet3Plus,
+				jobsWeitergeleitet5Plus: bullhornResult.jobsWeitergeleitet5Plus,
+			},
+		};
+		for (const group of outputGroups) {
+			const data = bullhornResult.bySource[group] ?? {
+				submissionsWeitergeleitet: 0,
+				jobsWeitergeleitet3Plus: 0,
+				jobsWeitergeleitet5Plus: 0,
+			};
+			bullhornObj[group] = {
+				submissionsWeitergeleitet: data.submissionsWeitergeleitet,
+				jobsWeitergeleitet3Plus: data.jobsWeitergeleitet3Plus,
+				jobsWeitergeleitet5Plus: data.jobsWeitergeleitet5Plus,
+			};
+		}
+
+		const output: IDataObject = {
+			period: {
+				date: endDate.toISOString().split('T')[0],
+				month: monthName,
+				monthNumber,
+				year,
+				periodStart: startDate.toISOString(),
+				periodEnd: endDate.toISOString(),
+			},
+			walichat: walichatObj,
+			ringover: ringoverObj,
+			bullhorn: bullhornObj,
+		};
 
 		return [[{ json: output }]];
 	}
@@ -482,6 +530,27 @@ function parseLabelGroups(
 		labelToGroup,
 		outputGroups: Array.from(outputGroupsSet),
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Source categorization (shared by Bullhorn & Ringover)
+// ---------------------------------------------------------------------------
+
+function categorizeSource(
+	value: string,
+	labelToGroup: Record<string, string>,
+): string {
+	const lower = value.toLowerCase().trim();
+	if (!lower) return 'Other';
+	// Exact match first
+	if (labelToGroup[lower]) return labelToGroup[lower];
+	// Substring match for flexibility (e.g., "Indeed.com Bewerbung" → Indeed)
+	for (const [label, group] of Object.entries(labelToGroup)) {
+		if (lower.includes(label) || label.includes(lower)) {
+			return group;
+		}
+	}
+	return 'Other';
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +852,10 @@ async function ringoverRequest(
 }
 
 
+// Ringover API allows a max date range of ~14 days per request.
+// For longer periods, we split into 14-day chunks.
+const RINGOVER_MAX_RANGE_MS = 14 * 24 * 60 * 60 * 1000;
+
 async function fetchAllCallsForKey(
 	ctx: IExecuteFunctions,
 	apiKey: string,
@@ -791,32 +864,42 @@ async function fetchAllCallsForKey(
 	endDate: Date,
 ): Promise<IDataObject[]> {
 	const allCalls: IDataObject[] = [];
-	let offset = 0;
-	const limit = 500;
 
-	while (true) {
-		const qs: IDataObject = {
-			start_date: startDate.toISOString(),
-			end_date: endDate.toISOString(),
-			limit_count: limit,
-			limit_offset: offset,
-		};
+	// Split into 14-day chunks
+	let chunkStart = startDate.getTime();
+	const endMs = endDate.getTime();
 
-		let resp: IDataObject;
-		try {
-			resp = await ringoverRequest(ctx, apiKey, baseUrl, 'GET', '/calls', undefined, qs);
-		} catch {
-			break;
+	while (chunkStart < endMs) {
+		const chunkEnd = Math.min(chunkStart + RINGOVER_MAX_RANGE_MS, endMs);
+		let offset = 0;
+		const limit = 500;
+
+		while (true) {
+			const qs: IDataObject = {
+				start_date: new Date(chunkStart).toISOString(),
+				end_date: new Date(chunkEnd).toISOString(),
+				limit_count: limit,
+				limit_offset: offset,
+			};
+
+			let resp: IDataObject;
+			try {
+				resp = await ringoverRequest(ctx, apiKey, baseUrl, 'GET', '/calls', undefined, qs);
+			} catch {
+				break;
+			}
+
+			const callList = (resp as IDataObject)?.call_list;
+			if (Array.isArray(callList) && callList.length > 0) {
+				allCalls.push(...(callList as IDataObject[]));
+				if (callList.length < limit) break;
+				offset += callList.length;
+			} else {
+				break;
+			}
 		}
 
-		const callList = (resp as IDataObject)?.call_list;
-		if (Array.isArray(callList) && callList.length > 0) {
-			allCalls.push(...(callList as IDataObject[]));
-			if (callList.length < limit) break;
-			offset += callList.length;
-		} else {
-			break;
-		}
+		chunkStart = chunkEnd;
 	}
 
 	return allCalls;
@@ -826,6 +909,8 @@ async function fetchRingoverKpis(
 	this: IExecuteFunctions,
 	startDate: Date,
 	endDate: Date,
+	labelToGroup: Record<string, string>,
+	outputGroups: string[],
 ): Promise<RingoverKpiResult> {
 	// Read Ringover API keys from node property (one per line)
 	const keysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
@@ -865,17 +950,48 @@ async function fetchRingoverKpis(
 		return direction === 'out';
 	});
 
-	const callsMade = outboundCalls.length;
+	// Initialize per-source counters
+	const bySource: Record<string, RingoverCategoryCounts> = {};
+	for (const group of outputGroups) {
+		bySource[group] = { callsMade: 0, callsAnswered: 0 };
+	}
 
-	// Count calls where someone picked up: is_answered === true AND
-	// incall_duration > 30 seconds (actual conversation time)
-	const callsAnswered = outboundCalls.filter((call) => {
-		if (call.is_answered !== true) return false;
-		const incallDuration = (call.incall_duration as number) ?? 0;
-		return incallDuration > 30;
-	}).length;
+	let callsMade = 0;
+	let callsAnswered = 0;
 
-	return { callsMade, callsAnswered };
+	for (const call of outboundCalls) {
+		// Extract label/tag for categorization
+		// Try tags array first, then label string field
+		let tagName = '';
+		const tags = call.tags as IDataObject[] | undefined;
+		if (Array.isArray(tags) && tags.length > 0) {
+			tagName = (tags[0].name as string) || (tags[0].tag as string) || '';
+		}
+		if (!tagName) {
+			tagName = (call.label as string) || '';
+		}
+
+		const category = categorizeSource(tagName, labelToGroup);
+
+		callsMade++;
+		if (bySource[category]) {
+			bySource[category].callsMade++;
+		}
+
+		// Count calls where someone picked up: is_answered === true AND
+		// incall_duration > 30 seconds (actual conversation time)
+		if (call.is_answered === true) {
+			const incallDuration = (call.incall_duration as number) ?? 0;
+			if (incallDuration > 30) {
+				callsAnswered++;
+				if (bySource[category]) {
+					bySource[category].callsAnswered++;
+				}
+			}
+		}
+	}
+
+	return { callsMade, callsAnswered, bySource };
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,6 +1188,8 @@ async function fetchBullhornKpis(
 	this: IExecuteFunctions,
 	startDate: Date,
 	endDate: Date,
+	labelToGroup: Record<string, string>,
+	outputGroups: string[],
 ): Promise<BullhornKpiResult> {
 	const session = await bullhornAuthenticate.call(this);
 
@@ -1086,17 +1204,42 @@ async function fetchBullhornKpis(
 		session,
 		'JobSubmission',
 		submissionWhere,
-		'id,dateAdded,status,jobOrder',
+		'id,dateAdded,status,jobOrder,source',
 	);
 
 	const submissionsWeitergeleitet = submissions.length;
 
-	// Step 2: Extract unique JobOrder IDs from those submissions
+	// Initialize per-source counters
+	const bySource: Record<string, BullhornCategoryCounts> = {};
+	for (const group of outputGroups) {
+		bySource[group] = {
+			submissionsWeitergeleitet: 0,
+			jobsWeitergeleitet3Plus: 0,
+			jobsWeitergeleitet5Plus: 0,
+		};
+	}
+
+	// Step 2: Extract unique JobOrder IDs (total and per category)
 	const jobOrderIds = new Set<number>();
+	const jobOrderIdsByCategory: Record<string, Set<number>> = {};
+	for (const group of outputGroups) {
+		jobOrderIdsByCategory[group] = new Set();
+	}
+
 	for (const sub of submissions) {
+		const sourceValue = (sub.source as string) || '';
+		const category = categorizeSource(sourceValue, labelToGroup);
+
+		if (bySource[category]) {
+			bySource[category].submissionsWeitergeleitet++;
+		}
+
 		const jobOrder = sub.jobOrder as IDataObject | undefined;
 		if (jobOrder?.id) {
 			jobOrderIds.add(jobOrder.id as number);
+			if (jobOrderIdsByCategory[category]) {
+				jobOrderIdsByCategory[category].add(jobOrder.id as number);
+			}
 		}
 	}
 
@@ -1115,11 +1258,25 @@ async function fetchBullhornKpis(
 			'id,customInt1',
 		);
 
-		// Step 4: Count by customInt1 threshold
+		// Build map of jobOrder id -> customInt1
+		const jobOrderCustomInt = new Map<number, number>();
+		for (const jo of jobOrders) {
+			jobOrderCustomInt.set(jo.id as number, (jo.customInt1 as number) ?? 0);
+		}
+
+		// Step 4: Count by customInt1 threshold (total and per category)
 		for (const jo of jobOrders) {
 			const customInt1 = (jo.customInt1 as number) ?? 0;
 			if (customInt1 >= 3) jobsWeitergeleitet3Plus++;
 			if (customInt1 >= 5) jobsWeitergeleitet5Plus++;
+		}
+
+		for (const group of outputGroups) {
+			for (const joId of jobOrderIdsByCategory[group]) {
+				const customInt1 = jobOrderCustomInt.get(joId) ?? 0;
+				if (customInt1 >= 3) bySource[group].jobsWeitergeleitet3Plus++;
+				if (customInt1 >= 5) bySource[group].jobsWeitergeleitet5Plus++;
+			}
 		}
 	}
 
@@ -1127,5 +1284,6 @@ async function fetchBullhornKpis(
 		submissionsWeitergeleitet,
 		jobsWeitergeleitet3Plus,
 		jobsWeitergeleitet5Plus,
+		bySource,
 	};
 }
