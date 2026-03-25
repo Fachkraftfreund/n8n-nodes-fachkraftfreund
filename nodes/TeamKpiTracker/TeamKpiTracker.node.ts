@@ -897,74 +897,67 @@ async function bullhornAuthenticate(
 	const password = credentials.password as string;
 	const dataCenterSetting = (credentials.dataCenter as string) || 'auto';
 
-	// Step 1: Determine data center
-	let dataCenter: string;
+	// Step 1: Discover data center URLs from loginInfo
+	let authBaseUrl: string;
+	let restLoginBaseUrl: string;
+
 	if (dataCenterSetting === 'auto') {
-		const loginInfoResp = (await this.helpers.httpRequest({
+		const loginInfo = (await this.helpers.httpRequest({
 			method: 'GET',
-			url: 'https://rest.bullhornstaffing.com/rest-services/loginInfo',
-			qs: { username } as Record<string, string>,
+			url: `https://rest.bullhornstaffing.com/rest-services/loginInfo?username=${encodeURIComponent(username)}`,
 		})) as IDataObject;
 
-		const authUrl = loginInfoResp.oauthUrl as string;
-		if (!authUrl) {
+		const oauthUrl = (loginInfo.oauthUrl as string) || '';
+		const restUrl = (loginInfo.restUrl as string) || '';
+
+		if (!oauthUrl) {
 			throw new NodeOperationError(
 				this.getNode(),
 				'Could not determine Bullhorn data center from loginInfo',
 			);
 		}
-		const match = authUrl.match(/auth[-.]([^.]*)?\.?bullhornstaffing\.com/);
-		dataCenter = match?.[1] || '';
+
+		authBaseUrl = oauthUrl.replace(/\/oauth(\/authorize)?.*$/, '');
+		restLoginBaseUrl = restUrl.replace(/\/rest-services\/?.*$/, '');
 	} else {
-		dataCenter = dataCenterSetting;
+		authBaseUrl = `https://auth-${dataCenterSetting}.bullhornstaffing.com`;
+		restLoginBaseUrl = `https://rest-${dataCenterSetting}.bullhornstaffing.com`;
 	}
 
-	const authHost = dataCenter
-		? `auth-${dataCenter}.bullhornstaffing.com`
-		: 'auth.bullhornstaffing.com';
-	const restHost = dataCenter
-		? `rest-${dataCenter}.bullhornstaffing.com`
-		: 'rest.bullhornstaffing.com';
-
-	// Step 2: Get authorization code
-	// Use a non-resolving redirect_uri so that Bullhorn redirects to it with
-	// the auth code in the URL. n8n's httpRequest follows redirects, which
-	// would consume the code. By redirecting to a dead endpoint, the request
-	// fails and the error message/URL contains the code we need.
-	const redirectUri = 'https://localhost/bullhorn-oauth-callback';
+	// Step 2: Get authorization code (using helpers.request with followRedirect: false
+	// to capture the code from the Location header without consuming it)
 	const authorizeUrl =
-		`https://${authHost}/oauth/authorize` +
+		`${authBaseUrl}/oauth/authorize` +
 		`?client_id=${encodeURIComponent(clientId)}` +
 		`&response_type=code` +
 		`&action=Login` +
-		`&redirect_uri=${encodeURIComponent(redirectUri)}` +
 		`&username=${encodeURIComponent(username)}` +
 		`&password=${encodeURIComponent(password)}`;
 
 	let authCode: string | undefined;
-	try {
-		const authResp = (await this.helpers.httpRequest({
-			method: 'GET',
-			url: authorizeUrl,
-			skipSslCertificateValidation: true,
-			ignoreHttpStatusErrors: true,
-		})) as string | IDataObject;
 
-		const respStr =
-			typeof authResp === 'string' ? authResp : JSON.stringify(authResp);
-		const codeMatch = respStr.match(/code=([^&"'\s]+)/);
-		if (codeMatch) {
-			authCode = codeMatch[1];
-		} else if (typeof authResp === 'object' && authResp.authorizationCode) {
-			authCode = authResp.authorizationCode as string;
-		}
-	} catch (error) {
-		// Expected: the redirect to localhost fails, but the error/URL contains the code
-		const errMsg = (error as Error).message || String(error);
-		const codeMatch = errMsg.match(/code=([^&"'\s]+)/);
-		if (codeMatch) {
-			authCode = codeMatch[1];
-		}
+	const authResp = await this.helpers.request({
+		method: 'GET',
+		uri: authorizeUrl,
+		followRedirect: false,
+		resolveWithFullResponse: true,
+		simple: false,
+	});
+
+	// Extract code from Location header
+	const location = authResp.headers?.location || '';
+	if (location) {
+		const locMatch = location.match(/code=([^&]+)/);
+		if (locMatch) authCode = locMatch[1];
+	}
+
+	// Fallback: check body
+	if (!authCode && authResp.body) {
+		const bodyStr = typeof authResp.body === 'string'
+			? authResp.body
+			: JSON.stringify(authResp.body);
+		const bodyMatch = bodyStr.match(/code=([^&"'\s]+)/);
+		if (bodyMatch) authCode = bodyMatch[1];
 	}
 
 	if (!authCode) {
@@ -974,19 +967,17 @@ async function bullhornAuthenticate(
 		);
 	}
 
-	// URL-decode the auth code (Bullhorn encodes the colon as %3A)
-	authCode = decodeURIComponent(authCode);
-
 	// Step 3: Exchange code for access token
+	const tokenUrl =
+		`${authBaseUrl}/oauth/token` +
+		`?grant_type=authorization_code` +
+		`&code=${encodeURIComponent(authCode)}` +
+		`&client_id=${encodeURIComponent(clientId)}` +
+		`&client_secret=${encodeURIComponent(clientSecret)}`;
+
 	const tokenResp = (await this.helpers.httpRequest({
 		method: 'POST',
-		url: `https://${authHost}/oauth/token`,
-		qs: {
-			grant_type: 'authorization_code',
-			code: authCode,
-			client_id: clientId,
-			client_secret: clientSecret,
-		} as Record<string, string>,
+		url: tokenUrl,
 	})) as IDataObject;
 
 	const accessToken = tokenResp.access_token as string;
@@ -998,13 +989,14 @@ async function bullhornAuthenticate(
 	}
 
 	// Step 4: Login to REST API
+	const loginUrl =
+		`${restLoginBaseUrl}/rest-services/login` +
+		`?version=2.0` +
+		`&access_token=${encodeURIComponent(accessToken)}`;
+
 	const loginResp = (await this.helpers.httpRequest({
 		method: 'POST',
-		url: `https://${restHost}/rest-services/login`,
-		qs: {
-			version: '*',
-			access_token: accessToken,
-		} as Record<string, string>,
+		url: loginUrl,
 	})) as IDataObject;
 
 	const bhRestToken = loginResp.BhRestToken as string;
