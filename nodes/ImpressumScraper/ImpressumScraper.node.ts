@@ -755,6 +755,11 @@ export class ImpressumScraper implements INodeType {
 			data.emails = data.emails.map(normalizeEmail);
 		}
 
+		// ── Phase 8b: Prioritize emails ─────────────────────────
+		for (const { data } of successfulJobs) {
+			data.emails = prioritizeEmails(data.emails, data.firstName, data.lastName);
+		}
+
 		// ── Phase 9: Normalize phone numbers via OpenAI ──────────
 		if (openAiKey && successfulJobs.length > 0) {
 			await normalizePhoneNumbers(this, successfulJobs, openAiKey, openAiModel);
@@ -2232,6 +2237,47 @@ function looksLikePersonName(line: string): boolean {
 	);
 	if (capitalWords.length >= 2 && words.length <= 5) return true;
 	return false;
+}
+
+const UNIVERSAL_EMAIL_PREFIXES = [
+	'info', 'kontakt', 'contact', 'office', 'praxis', 'mail',
+	'post', 'empfang', 'rezeption', 'verwaltung', 'service',
+	'hello', 'hallo', 'anfrage', 'zentrale',
+];
+
+/**
+ * Sorts emails so the decision-maker's address comes first, followed by
+ * universal/generic addresses (info@, kontakt@, etc.), then everything else.
+ */
+function prioritizeEmails(
+	emails: string[],
+	firstName: string | null,
+	lastName: string | null,
+): string[] {
+	if (emails.length <= 1) return emails;
+
+	const nameTokens: string[] = [];
+	if (firstName) nameTokens.push(firstName.toLowerCase());
+	if (lastName) nameTokens.push(lastName.toLowerCase());
+
+	function score(email: string): number {
+		const local = email.toLowerCase().split('@')[0] || '';
+
+		// Score 0 (highest priority): email contains the person's name parts
+		if (nameTokens.length > 0 && nameTokens.some((t) => t.length >= 2 && local.includes(t))) {
+			return 0;
+		}
+
+		// Score 2 (lowest): universal/generic prefixes
+		if (UNIVERSAL_EMAIL_PREFIXES.some((p) => local === p)) {
+			return 2;
+		}
+
+		// Score 1: other personal-looking emails (not generic, not matched by name)
+		return 1;
+	}
+
+	return [...emails].sort((a, b) => score(a) - score(b));
 }
 
 function normalizeEmail(email: string): string {

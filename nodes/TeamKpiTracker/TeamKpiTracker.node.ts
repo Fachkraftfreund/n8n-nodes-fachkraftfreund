@@ -1,6 +1,8 @@
 import type {
 	IExecuteFunctions,
+	ILoadOptionsFunctions,
 	INodeExecutionData,
+	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 	IDataObject,
@@ -148,8 +150,12 @@ export class TeamKpiTracker implements INodeType {
 			{
 				displayName: 'OpenAI Model',
 				name: 'openAiModel',
-				type: 'string',
+				type: 'options',
+				typeOptions: {
+					loadOptionsMethod: 'getOpenAiModels',
+				},
 				default: 'gpt-4.1-nano',
+				noDataExpression: true,
 				description:
 					'The OpenAI model used to classify positive replies. Only used when OpenAI credentials are configured.',
 			},
@@ -192,6 +198,57 @@ export class TeamKpiTracker implements INodeType {
 				],
 			},
 		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getOpenAiModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const FALLBACK: INodePropertyOptions[] = [
+					{ name: 'gpt-4.1-nano', value: 'gpt-4.1-nano' },
+					{ name: 'gpt-4.1-mini', value: 'gpt-4.1-mini' },
+					{ name: 'gpt-4.1', value: 'gpt-4.1' },
+					{ name: 'gpt-4o-mini', value: 'gpt-4o-mini' },
+					{ name: 'gpt-4o', value: 'gpt-4o' },
+					{ name: 'o3-mini', value: 'o3-mini' },
+					{ name: 'o4-mini', value: 'o4-mini' },
+				];
+
+				let apiKey: string;
+				try {
+					const creds = await this.getCredentials('openAiApi');
+					apiKey = creds.apiKey as string;
+				} catch {
+					return FALLBACK;
+				}
+
+				try {
+					const response = await this.helpers.httpRequest({
+						method: 'GET',
+						url: 'https://api.openai.com/v1/models',
+						headers: { Authorization: `Bearer ${apiKey}` },
+						timeout: 10000,
+					});
+
+					const EXCLUDE =
+						/audio|image|realtime|tts|transcribe|instruct|search|codex|computer|embedding|moderation|dall-e|sora|whisper|babbage|davinci|chatgpt/i;
+					const SKIP_VARIANT = /\d{4}-\d{2}-\d{2}|-\d{3,4}(-|$)|-preview|-16k|-chat-latest/;
+
+					const models: INodePropertyOptions[] = (response?.data || [])
+						.map((m: { id: string }) => m.id)
+						.filter((id: string) => {
+							if (EXCLUDE.test(id)) return false;
+							if (SKIP_VARIANT.test(id)) return false;
+							return /^(gpt-|o[134])/.test(id);
+						})
+						.sort((a: string, b: string) => a.localeCompare(b))
+						.map((id: string) => ({ name: id, value: id }));
+
+					return models.length > 0 ? models : FALLBACK;
+				} catch {
+					return FALLBACK;
+				}
+			},
+		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
