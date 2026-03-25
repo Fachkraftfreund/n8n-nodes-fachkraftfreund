@@ -848,10 +848,17 @@ async function ringoverRequest(
 	body?: IDataObject,
 	qs?: IDataObject,
 ): Promise<IDataObject> {
+	// Build URL with query params explicitly (matching the format that works in tests)
+	const url = new URL(`${baseUrl}${path}`);
+	if (qs) {
+		for (const [k, v] of Object.entries(qs)) {
+			url.searchParams.set(k, String(v));
+		}
+	}
+
 	const options: IHttpRequestOptions = {
 		method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
-		url: `${baseUrl}${path}`,
-		qs: qs as Record<string, string>,
+		url: url.toString(),
 		body,
 	};
 	// Use credential-based auth for the primary key (null),
@@ -962,9 +969,22 @@ async function fetchRingoverKpis(
 	// Primary key (null) uses httpRequestWithAuthentication; additional keys use manual auth
 	const allKeyArgs: Array<string | null> = [null, ...additionalKeys];
 	const keyPromises = allKeyArgs.map((key) =>
-		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate),
+		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate)
+			.catch((err) => {
+				// Collect errors per key but don't fail the whole operation
+				const label = key === null ? 'primary (credential)' : `key ${key.substring(0, 8)}…`;
+				keyErrors.push(`${label}: ${(err as Error).message}`);
+				return [] as IDataObject[];
+			}),
 	);
+	const keyErrors: string[] = [];
 	const keyResults = await Promise.all(keyPromises);
+
+	// If ALL keys failed, throw a combined error
+	if (keyResults.every((r) => r.length === 0) && keyErrors.length > 0) {
+		throw new Error(`All Ringover API keys failed:\n${keyErrors.join('\n')}`);
+	}
+
 	const seenCallIds = new Set<string>();
 	const allCalls: IDataObject[] = [];
 	for (const calls of keyResults) {
