@@ -56,16 +56,16 @@ interface BullhornKpiResult {
 	bySource: Record<string, BullhornCategoryCounts>;
 }
 
-interface RingoverCategoryCounts {
-	callsMade: number;
-	callsAnswered: number;
-}
+// interface RingoverCategoryCounts {
+// 	callsMade: number;
+// 	callsAnswered: number;
+// }
 
-interface RingoverKpiResult {
-	callsMade: number;
-	callsAnswered: number;
-	bySource: Record<string, RingoverCategoryCounts>;
-}
+// interface RingoverKpiResult {
+// 	callsMade: number;
+// 	callsAnswered: number;
+// 	bySource: Record<string, RingoverCategoryCounts>;
+// }
 
 // ---------------------------------------------------------------------------
 // Node
@@ -98,13 +98,13 @@ export class TeamKpiTracker implements INodeType {
 					show: { enableBullhorn: [true] },
 				},
 			},
-			{
-				name: 'ringoverApi',
-				required: false,
-				displayOptions: {
-					show: { enableRingover: [true] },
-				},
-			},
+			// {
+			// 	name: 'ringoverApi',
+			// 	required: false,
+			// 	displayOptions: {
+			// 		show: { enableRingover: [true] },
+			// 	},
+			// },
 		],
 		properties: [
 			// ----------------------------------
@@ -150,13 +150,13 @@ export class TeamKpiTracker implements INodeType {
 				default: true,
 				description: 'Whether to fetch data from Bullhorn (JobSubmissions & Pipeline)',
 			},
-			{
-				displayName: 'Enable Ringover',
-				name: 'enableRingover',
-				type: 'boolean',
-				default: true,
-				description: 'Whether to fetch call data from Ringover',
-			},
+			// {
+			// 	displayName: 'Enable Ringover',
+			// 	name: 'enableRingover',
+			// 	type: 'boolean',
+			// 	default: true,
+			// 	description: 'Whether to fetch call data from Ringover',
+			// },
 
 			// ----------------------------------
 			//         OpenAI Settings
@@ -183,19 +183,19 @@ export class TeamKpiTracker implements INodeType {
 					'The OpenAI model used to classify positive replies.',
 			},
 
-			// ----------------------------------
-			//         Ringover Settings
-			// ----------------------------------
-			{
-				displayName: 'Ringover API Keys',
-				name: 'ringoverApiKeys',
-				type: 'string',
-				typeOptions: { password: true, rows: 4 },
-				default: '',
-				displayOptions: { show: { enableRingover: [true] } },
-				description:
-					'Ringover API keys, one per line. All keys are queried and results are merged (deduplicated).',
-			},
+			// // ----------------------------------
+			// //         Ringover Settings
+			// // ----------------------------------
+			// {
+			// 	displayName: 'Ringover API Keys',
+			// 	name: 'ringoverApiKeys',
+			// 	type: 'string',
+			// 	typeOptions: { password: true, rows: 4 },
+			// 	default: '',
+			// 	displayOptions: { show: { enableRingover: [true] } },
+			// 	description:
+			// 		'Ringover API keys, one per line. All keys are queried and results are merged (deduplicated).',
+			// },
 
 			// ----------------------------------
 			//         WaliChat Settings
@@ -246,7 +246,7 @@ export class TeamKpiTracker implements INodeType {
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const period = this.getNodeParameter('period', 0) as string;
 		const enableBullhorn = this.getNodeParameter('enableBullhorn', 0) as boolean;
-		const enableRingover = this.getNodeParameter('enableRingover', 0) as boolean;
+		// const enableRingover = this.getNodeParameter('enableRingover', 0) as boolean;
 		const openAiModel = this.getNodeParameter('openAiModel', 0, 'gpt-4.1-nano') as string;
 		const waliChatSettings = this.getNodeParameter('waliChatSettings', 0) as IDataObject;
 
@@ -313,20 +313,20 @@ export class TeamKpiTracker implements INodeType {
 			}
 		}
 
-		// ==================== RINGOVER ====================
-		let ringoverResult: RingoverKpiResult = { callsMade: 0, callsAnswered: 0, bySource: {} };
-		if (enableRingover) {
-			try {
-				ringoverResult = await fetchRingoverKpis.call(this, startDate, endDate, labelToGroup, outputGroups);
-			} catch (error) {
-				if (!this.continueOnFail()) {
-					throw new NodeOperationError(
-						this.getNode(),
-						`Ringover error: ${(error as Error).message}`,
-					);
-				}
-			}
-		}
+		// // ==================== RINGOVER ====================
+		// let ringoverResult: RingoverKpiResult = { callsMade: 0, callsAnswered: 0, bySource: {} };
+		// if (enableRingover) {
+		// 	try {
+		// 		ringoverResult = await fetchRingoverKpis.call(this, startDate, endDate, labelToGroup, outputGroups);
+		// 	} catch (error) {
+		// 		if (!this.continueOnFail()) {
+		// 			throw new NodeOperationError(
+		// 				this.getNode(),
+		// 				`Ringover error: ${(error as Error).message}`,
+		// 			);
+		// 		}
+		// 	}
+		// }
 
 		// ==================== BULLHORN ====================
 		let bullhornResult: BullhornKpiResult = {
@@ -369,22 +369,22 @@ export class TeamKpiTracker implements INodeType {
 			};
 		}
 
-		const ringoverObj: IDataObject = {
-			total: {
-				callsMade: ringoverResult.callsMade,
-				callsAnswered: ringoverResult.callsAnswered,
-			},
-		};
-		for (const group of outputGroups) {
-			const data = ringoverResult.bySource[group] ?? {
-				callsMade: 0,
-				callsAnswered: 0,
-			};
-			ringoverObj[group] = {
-				callsMade: data.callsMade,
-				callsAnswered: data.callsAnswered,
-			};
-		}
+		// const ringoverObj: IDataObject = {
+		// 	total: {
+		// 		callsMade: ringoverResult.callsMade,
+		// 		callsAnswered: ringoverResult.callsAnswered,
+		// 	},
+		// };
+		// for (const group of outputGroups) {
+		// 	const data = ringoverResult.bySource[group] ?? {
+		// 		callsMade: 0,
+		// 		callsAnswered: 0,
+		// 	};
+		// 	ringoverObj[group] = {
+		// 		callsMade: data.callsMade,
+		// 		callsAnswered: data.callsAnswered,
+		// 	};
+		// }
 
 		const bullhornObj: IDataObject = {
 			total: {
@@ -416,7 +416,7 @@ export class TeamKpiTracker implements INodeType {
 				periodEnd: endDate.toISOString(),
 			},
 			walichat: walichatObj,
-			ringover: ringoverObj,
+			// ringover: ringoverObj,
 			bullhorn: bullhornObj,
 		};
 
@@ -834,220 +834,220 @@ async function fetchChatInboundText(
 	return inboundTexts;
 }
 
-// ---------------------------------------------------------------------------
-// Ringover: Fetch call KPIs
-// ---------------------------------------------------------------------------
-
-
-async function ringoverRequest(
-	ctx: IExecuteFunctions,
-	apiKey: string | null,
-	baseUrl: string,
-	method: string,
-	path: string,
-	body?: IDataObject,
-	qs?: IDataObject,
-): Promise<IDataObject> {
-	// Build URL with query params explicitly (matching the format that works in tests)
-	const url = new URL(`${baseUrl}${path}`);
-	if (qs) {
-		for (const [k, v] of Object.entries(qs)) {
-			url.searchParams.set(k, String(v));
-		}
-	}
-
-	const options: IHttpRequestOptions = {
-		method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
-		url: url.toString(),
-		body,
-	};
-	// Use credential-based auth for the primary key (null),
-	// manual Authorization header for additional keys
-	if (apiKey === null) {
-		return ctx.helpers.httpRequestWithAuthentication.call(
-			ctx,
-			'ringoverApi',
-			options,
-		) as Promise<IDataObject>;
-	}
-	options.headers = { Authorization: apiKey };
-	return ctx.helpers.httpRequest(options) as Promise<IDataObject>;
-}
-
-
-// Ringover API allows a max date range of ~14 days per request.
-// For longer periods, we split into 14-day chunks.
-const RINGOVER_MAX_RANGE_MS = 14 * 24 * 60 * 60 * 1000;
-
-async function fetchAllCallsForKey(
-	ctx: IExecuteFunctions,
-	apiKey: string | null,
-	baseUrl: string,
-	startDate: Date,
-	endDate: Date,
-): Promise<IDataObject[]> {
-	const allCalls: IDataObject[] = [];
-
-	// Split into 14-day chunks
-	let chunkStart = startDate.getTime();
-	const endMs = endDate.getTime();
-	let firstRequest = true;
-
-	while (chunkStart < endMs) {
-		const chunkEnd = Math.min(chunkStart + RINGOVER_MAX_RANGE_MS, endMs);
-		let offset = 0;
-		const limit = 500;
-
-		while (true) {
-			const qs: IDataObject = {
-				start_date: new Date(chunkStart).toISOString(),
-				end_date: new Date(chunkEnd).toISOString(),
-				limit_count: limit,
-				limit_offset: offset,
-			};
-
-			let resp: IDataObject;
-			try {
-				resp = await ringoverRequest(ctx, apiKey, baseUrl, 'GET', '/calls', undefined, qs);
-			} catch (error) {
-				// Let the first request error propagate so the user sees what went wrong
-				// (e.g. auth failure, wrong URL). Only swallow errors on subsequent pages
-				// where we already have partial data.
-				if (firstRequest) throw error;
-				break;
-			}
-			firstRequest = false;
-
-			const callList = (resp as IDataObject)?.call_list;
-			if (Array.isArray(callList) && callList.length > 0) {
-				allCalls.push(...(callList as IDataObject[]));
-				if (callList.length < limit) break;
-				offset += callList.length;
-			} else {
-				break;
-			}
-		}
-
-		chunkStart = chunkEnd;
-	}
-
-	return allCalls;
-}
-
-async function fetchRingoverKpis(
-	this: IExecuteFunctions,
-	startDate: Date,
-	endDate: Date,
-	labelToGroup: Record<string, string>,
-	outputGroups: string[],
-): Promise<RingoverKpiResult> {
-	// Read region and additional keys from credential
-	const credentials = await this.getCredentials('ringoverApi');
-	const additionalKeysStr = (credentials.additionalApiKeys as string) || '';
-	const region = (credentials.region as string) || 'eu';
-
-	// Primary key uses credential-based auth (null), additional keys use manual headers
-	const additionalKeys: string[] = additionalKeysStr
-		.split('\n')
-		.map((k) => k.trim())
-		.filter((k) => k.length > 0);
-
-	// Also include keys from the legacy node parameter if present
-	const legacyKeysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
-	const legacyKeys = legacyKeysStr.split('\n').map((k) => k.trim()).filter((k) => k.length > 0);
-	for (const k of legacyKeys) {
-		if (!additionalKeys.includes(k)) additionalKeys.push(k);
-	}
-
-	const baseUrl = region === 'us'
-		? 'https://public-api-us.ringover.com/v2'
-		: 'https://public-api.ringover.com/v2';
-
-	// Fetch all calls from all keys in parallel (with pagination per key)
-	// Deduplicate by call_id since multiple keys in the same account see
-	// the same calls.
-	// Primary key (null) uses httpRequestWithAuthentication; additional keys use manual auth
-	const allKeyArgs: Array<string | null> = [null, ...additionalKeys];
-	const keyPromises = allKeyArgs.map((key) =>
-		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate)
-			.catch((err) => {
-				// Collect errors per key but don't fail the whole operation
-				const label = key === null ? 'primary (credential)' : `key ${key.substring(0, 8)}…`;
-				keyErrors.push(`${label}: ${(err as Error).message}`);
-				return [] as IDataObject[];
-			}),
-	);
-	const keyErrors: string[] = [];
-	const keyResults = await Promise.all(keyPromises);
-
-	// If ALL keys failed, throw a combined error
-	if (keyResults.every((r) => r.length === 0) && keyErrors.length > 0) {
-		throw new Error(`All Ringover API keys failed:\n${keyErrors.join('\n')}`);
-	}
-
-	const seenCallIds = new Set<string>();
-	const allCalls: IDataObject[] = [];
-	for (const calls of keyResults) {
-		for (const call of calls) {
-			const callId = call.call_id as string;
-			if (callId && !seenCallIds.has(callId)) {
-				seenCallIds.add(callId);
-				allCalls.push(call);
-			}
-		}
-	}
-
-	// Count outbound calls (Ringover uses "out" for direction)
-	const outboundCalls = allCalls.filter((call) => {
-		const direction = ((call.direction as string) || '').toLowerCase();
-		return direction === 'out';
-	});
-
-	// Initialize per-source counters
-	const bySource: Record<string, RingoverCategoryCounts> = {};
-	for (const group of outputGroups) {
-		bySource[group] = { callsMade: 0, callsAnswered: 0 };
-	}
-
-	let callsMade = 0;
-	let callsAnswered = 0;
-
-	for (const call of outboundCalls) {
-		// Extract label/tag for categorization
-		// Try tags array first, then label string field
-		let tagName = '';
-		const tags = call.tags as IDataObject[] | undefined;
-		if (Array.isArray(tags) && tags.length > 0) {
-			tagName = (tags[0].name as string) || (tags[0].tag as string) || '';
-		}
-		if (!tagName) {
-			tagName = (call.label as string) || '';
-		}
-
-		const category = categorizeSource(tagName, labelToGroup);
-
-		callsMade++;
-		if (bySource[category]) {
-			bySource[category].callsMade++;
-		}
-
-		// Count calls where someone picked up: is_answered === true AND
-		// incall_duration > 30 seconds (actual conversation time)
-		if (call.is_answered === true) {
-			const incallDuration = (call.incall_duration as number) ?? 0;
-			if (incallDuration > 30) {
-				callsAnswered++;
-				if (bySource[category]) {
-					bySource[category].callsAnswered++;
-				}
-			}
-		}
-	}
-
-	return { callsMade, callsAnswered, bySource };
-}
-
-// ---------------------------------------------------------------------------
+// // ---------------------------------------------------------------------------
+// // Ringover: Fetch call KPIs
+// // ---------------------------------------------------------------------------
+//
+//
+// async function ringoverRequest(
+// 	ctx: IExecuteFunctions,
+// 	apiKey: string | null,
+// 	baseUrl: string,
+// 	method: string,
+// 	path: string,
+// 	body?: IDataObject,
+// 	qs?: IDataObject,
+// ): Promise<IDataObject> {
+// 	// Build URL with query params explicitly (matching the format that works in tests)
+// 	const url = new URL(`${baseUrl}${path}`);
+// 	if (qs) {
+// 		for (const [k, v] of Object.entries(qs)) {
+// 			url.searchParams.set(k, String(v));
+// 		}
+// 	}
+//
+// 	const options: IHttpRequestOptions = {
+// 		method: method as 'GET' | 'POST' | 'PUT' | 'DELETE',
+// 		url: url.toString(),
+// 		body,
+// 	};
+// 	// Use credential-based auth for the primary key (null),
+// 	// manual Authorization header for additional keys
+// 	if (apiKey === null) {
+// 		return ctx.helpers.httpRequestWithAuthentication.call(
+// 			ctx,
+// 			'ringoverApi',
+// 			options,
+// 		) as Promise<IDataObject>;
+// 	}
+// 	options.headers = { Authorization: apiKey };
+// 	return ctx.helpers.httpRequest(options) as Promise<IDataObject>;
+// }
+//
+//
+// // Ringover API allows a max date range of ~14 days per request.
+// // For longer periods, we split into 14-day chunks.
+// const RINGOVER_MAX_RANGE_MS = 14 * 24 * 60 * 60 * 1000;
+//
+// async function fetchAllCallsForKey(
+// 	ctx: IExecuteFunctions,
+// 	apiKey: string | null,
+// 	baseUrl: string,
+// 	startDate: Date,
+// 	endDate: Date,
+// ): Promise<IDataObject[]> {
+// 	const allCalls: IDataObject[] = [];
+//
+// 	// Split into 14-day chunks
+// 	let chunkStart = startDate.getTime();
+// 	const endMs = endDate.getTime();
+// 	let firstRequest = true;
+//
+// 	while (chunkStart < endMs) {
+// 		const chunkEnd = Math.min(chunkStart + RINGOVER_MAX_RANGE_MS, endMs);
+// 		let offset = 0;
+// 		const limit = 500;
+//
+// 		while (true) {
+// 			const qs: IDataObject = {
+// 				start_date: new Date(chunkStart).toISOString(),
+// 				end_date: new Date(chunkEnd).toISOString(),
+// 				limit_count: limit,
+// 				limit_offset: offset,
+// 			};
+//
+// 			let resp: IDataObject;
+// 			try {
+// 				resp = await ringoverRequest(ctx, apiKey, baseUrl, 'GET', '/calls', undefined, qs);
+// 			} catch (error) {
+// 				// Let the first request error propagate so the user sees what went wrong
+// 				// (e.g. auth failure, wrong URL). Only swallow errors on subsequent pages
+// 				// where we already have partial data.
+// 				if (firstRequest) throw error;
+// 				break;
+// 			}
+// 			firstRequest = false;
+//
+// 			const callList = (resp as IDataObject)?.call_list;
+// 			if (Array.isArray(callList) && callList.length > 0) {
+// 				allCalls.push(...(callList as IDataObject[]));
+// 				if (callList.length < limit) break;
+// 				offset += callList.length;
+// 			} else {
+// 				break;
+// 			}
+// 		}
+//
+// 		chunkStart = chunkEnd;
+// 	}
+//
+// 	return allCalls;
+// }
+//
+// async function fetchRingoverKpis(
+// 	this: IExecuteFunctions,
+// 	startDate: Date,
+// 	endDate: Date,
+// 	labelToGroup: Record<string, string>,
+// 	outputGroups: string[],
+// ): Promise<RingoverKpiResult> {
+// 	// Read region and additional keys from credential
+// 	const credentials = await this.getCredentials('ringoverApi');
+// 	const additionalKeysStr = (credentials.additionalApiKeys as string) || '';
+// 	const region = (credentials.region as string) || 'eu';
+//
+// 	// Primary key uses credential-based auth (null), additional keys use manual headers
+// 	const additionalKeys: string[] = additionalKeysStr
+// 		.split('\n')
+// 		.map((k) => k.trim())
+// 		.filter((k) => k.length > 0);
+//
+// 	// Also include keys from the legacy node parameter if present
+// 	const legacyKeysStr = this.getNodeParameter('ringoverApiKeys', 0, '') as string;
+// 	const legacyKeys = legacyKeysStr.split('\n').map((k) => k.trim()).filter((k) => k.length > 0);
+// 	for (const k of legacyKeys) {
+// 		if (!additionalKeys.includes(k)) additionalKeys.push(k);
+// 	}
+//
+// 	const baseUrl = region === 'us'
+// 		? 'https://public-api-us.ringover.com/v2'
+// 		: 'https://public-api.ringover.com/v2';
+//
+// 	// Fetch all calls from all keys in parallel (with pagination per key)
+// 	// Deduplicate by call_id since multiple keys in the same account see
+// 	// the same calls.
+// 	// Primary key (null) uses httpRequestWithAuthentication; additional keys use manual auth
+// 	const allKeyArgs: Array<string | null> = [null, ...additionalKeys];
+// 	const keyPromises = allKeyArgs.map((key) =>
+// 		fetchAllCallsForKey(this, key, baseUrl, startDate, endDate)
+// 			.catch((err) => {
+// 				// Collect errors per key but don't fail the whole operation
+// 				const label = key === null ? 'primary (credential)' : `key ${key.substring(0, 8)}…`;
+// 				keyErrors.push(`${label}: ${(err as Error).message}`);
+// 				return [] as IDataObject[];
+// 			}),
+// 	);
+// 	const keyErrors: string[] = [];
+// 	const keyResults = await Promise.all(keyPromises);
+//
+// 	// If ALL keys failed, throw a combined error
+// 	if (keyResults.every((r) => r.length === 0) && keyErrors.length > 0) {
+// 		throw new Error(`All Ringover API keys failed:\n${keyErrors.join('\n')}`);
+// 	}
+//
+// 	const seenCallIds = new Set<string>();
+// 	const allCalls: IDataObject[] = [];
+// 	for (const calls of keyResults) {
+// 		for (const call of calls) {
+// 			const callId = call.call_id as string;
+// 			if (callId && !seenCallIds.has(callId)) {
+// 				seenCallIds.add(callId);
+// 				allCalls.push(call);
+// 			}
+// 		}
+// 	}
+//
+// 	// Count outbound calls (Ringover uses "out" for direction)
+// 	const outboundCalls = allCalls.filter((call) => {
+// 		const direction = ((call.direction as string) || '').toLowerCase();
+// 		return direction === 'out';
+// 	});
+//
+// 	// Initialize per-source counters
+// 	const bySource: Record<string, RingoverCategoryCounts> = {};
+// 	for (const group of outputGroups) {
+// 		bySource[group] = { callsMade: 0, callsAnswered: 0 };
+// 	}
+//
+// 	let callsMade = 0;
+// 	let callsAnswered = 0;
+//
+// 	for (const call of outboundCalls) {
+// 		// Extract label/tag for categorization
+// 		// Try tags array first, then label string field
+// 		let tagName = '';
+// 		const tags = call.tags as IDataObject[] | undefined;
+// 		if (Array.isArray(tags) && tags.length > 0) {
+// 			tagName = (tags[0].name as string) || (tags[0].tag as string) || '';
+// 		}
+// 		if (!tagName) {
+// 			tagName = (call.label as string) || '';
+// 		}
+//
+// 		const category = categorizeSource(tagName, labelToGroup);
+//
+// 		callsMade++;
+// 		if (bySource[category]) {
+// 			bySource[category].callsMade++;
+// 		}
+//
+// 		// Count calls where someone picked up: is_answered === true AND
+// 		// incall_duration > 30 seconds (actual conversation time)
+// 		if (call.is_answered === true) {
+// 			const incallDuration = (call.incall_duration as number) ?? 0;
+// 			if (incallDuration > 30) {
+// 				callsAnswered++;
+// 				if (bySource[category]) {
+// 					bySource[category].callsAnswered++;
+// 				}
+// 			}
+// 		}
+// 	}
+//
+// 	return { callsMade, callsAnswered, bySource };
+// }
+//
+// // ---------------------------------------------------------------------------
 // Bullhorn: Authentication (unchanged)
 // ---------------------------------------------------------------------------
 
