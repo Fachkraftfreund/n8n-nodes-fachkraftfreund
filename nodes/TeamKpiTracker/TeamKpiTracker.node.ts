@@ -220,15 +220,15 @@ export class TeamKpiTracker implements INodeType {
 						displayName: 'Source Labels',
 						name: 'sourceLabels',
 						type: 'string',
-						default: 'Stepstone,Indeed,Meta Pool,Meta Kundenspezifisch',
+						default: 'Stepstone,Indeed,Meta Pool,Meta Kundenspezifisch,Meta Ad',
 						description:
-							'Comma-separated WaliChat label names used to identify contact sources.',
+							'Comma-separated label/source names for WaliChat labels and Bullhorn candidate sources.',
 					},
 					{
 						displayName: 'Label Groups',
 						name: 'labelGroups',
 						type: 'string',
-						default: 'Meta=Meta Pool,Meta Kundenspezifisch',
+						default: 'Meta=Meta Pool,Meta Kundenspezifisch,Meta Ad',
 						description:
 							'Group multiple source labels into one output group. Format: GroupName=Label1,Label2 (one group per line).',
 					},
@@ -608,19 +608,24 @@ async function fetchWaliChatKpis(
 				undefined,
 				{
 					after: sinceDate,
-					size: WALICHAT_PAGE_SIZE,
-					page,
+					size: String(WALICHAT_PAGE_SIZE),
+					page: String(page),
 				},
 			)) as IDataObject[];
 
+			let hitOldChat = false;
 			for (const chat of chats) {
 				const chatDate = new Date(chat.date as string);
+				if (chatDate < startDate) {
+					hitOldChat = true;
+					break;
+				}
 				if (chatDate <= endDate) {
 					allChats.push({ chat, deviceId });
 				}
 			}
 
-			hasMore = chats.length >= WALICHAT_PAGE_SIZE;
+			hasMore = !hitOldChat && chats.length >= WALICHAT_PAGE_SIZE;
 			page++;
 		}
 	}
@@ -1257,7 +1262,7 @@ async function fetchBullhornKpis(
 		session,
 		'JobSubmission',
 		submissionWhere,
-		'id,dateAdded,status,jobOrder,source',
+		'id,dateAdded,status,jobOrder,candidate(source)',
 	);
 
 	const submissionsWeitergeleitet = submissions.length;
@@ -1280,7 +1285,9 @@ async function fetchBullhornKpis(
 	}
 
 	for (const sub of submissions) {
-		const sourceValue = (sub.source as string) || '';
+		const candidate = sub.candidate as IDataObject | undefined;
+		const candidateSources = (candidate?.source as string[]) ?? [];
+		const sourceValue = candidateSources[0] || '';
 		const category = categorizeSource(sourceValue, labelToGroup);
 
 		if (bySource[category]) {
