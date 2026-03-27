@@ -68,13 +68,7 @@ export class ApifyDataset implements INodeType {
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-		const datasetId = this.getNodeParameter('datasetId', 0) as string;
-		const limit = this.getNodeParameter('limit', 0, 0) as number;
-		const options = this.getNodeParameter('options', 0, {}) as {
-			pageSize?: number;
-		};
-		const pageSize = options.pageSize ?? PAGE_SIZE;
-
+		const inputItems = this.getInputData();
 		const creds = await this.getCredentials('apifyApi');
 		const token = creds.apiToken as string;
 		if (!token) {
@@ -84,55 +78,65 @@ export class ApifyDataset implements INodeType {
 			);
 		}
 
-		const base = `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}`;
-
-		// Step 1: Get dataset metadata to know total item count
-		const meta = (await this.helpers.httpRequest({
-			method: 'GET',
-			url: base,
-			qs: { token },
-			timeout: 30_000,
-		})) as { data?: { itemCount?: number } };
-
-		const totalItems = meta?.data?.itemCount ?? 0;
-		if (totalItems === 0) {
-			return [[]];
-		}
-
-		const want = limit > 0 ? Math.min(limit, totalItems) : totalItems;
-
-		// Step 2: Paginate through items
 		const returnData: INodeExecutionData[] = [];
-		let offset = 0;
 
-		while (offset < want) {
-			const batchLimit = Math.min(pageSize, want - offset);
+		for (let i = 0; i < inputItems.length; i++) {
+			const datasetId = this.getNodeParameter('datasetId', i) as string;
+			const limit = this.getNodeParameter('limit', i, 0) as number;
+			const options = this.getNodeParameter('options', i, {}) as {
+				pageSize?: number;
+			};
+			const pageSize = options.pageSize ?? PAGE_SIZE;
 
-			const items = (await this.helpers.httpRequest({
+			const base = `https://api.apify.com/v2/datasets/${encodeURIComponent(datasetId)}`;
+
+			// Step 1: Get dataset metadata to know total item count
+			const meta = (await this.helpers.httpRequest({
 				method: 'GET',
-				url: `${base}/items`,
-				qs: {
-					token,
-					offset,
-					limit: batchLimit,
-					format: 'json',
-				},
-				timeout: 120_000,
-			})) as IDataObject[];
+				url: base,
+				qs: { token },
+				timeout: 30_000,
+			})) as { data?: { itemCount?: number } };
 
-			if (!Array.isArray(items) || items.length === 0) {
-				break;
+			const totalItems = meta?.data?.itemCount ?? 0;
+			if (totalItems === 0) {
+				continue;
 			}
 
-			for (const item of items) {
-				returnData.push({ json: item });
-			}
+			const want = limit > 0 ? Math.min(limit, totalItems) : totalItems;
 
-			offset += items.length;
+			// Step 2: Paginate through items
+			let offset = 0;
 
-			// Fewer items than requested means we've reached the end
-			if (items.length < batchLimit) {
-				break;
+			while (offset < want) {
+				const batchLimit = Math.min(pageSize, want - offset);
+
+				const items = (await this.helpers.httpRequest({
+					method: 'GET',
+					url: `${base}/items`,
+					qs: {
+						token,
+						offset,
+						limit: batchLimit,
+						format: 'json',
+					},
+					timeout: 120_000,
+				})) as IDataObject[];
+
+				if (!Array.isArray(items) || items.length === 0) {
+					break;
+				}
+
+				for (const item of items) {
+					returnData.push({ json: item, pairedItem: { item: i } });
+				}
+
+				offset += items.length;
+
+				// Fewer items than requested means we've reached the end
+				if (items.length < batchLimit) {
+					break;
+				}
 			}
 		}
 
