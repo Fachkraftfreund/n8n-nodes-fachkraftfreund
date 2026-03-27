@@ -347,7 +347,8 @@ export class ApifyDataset implements INodeType {
 				let offset = 0;
 
 				while (true) {
-					const items = (await this.helpers.httpRequestWithAuthentication(
+					const items = (await this.helpers.httpRequestWithAuthentication.call(
+						this,
 						'apifyApi',
 						{
 							method: 'GET',
@@ -414,7 +415,8 @@ async function collectRuns(
 	let done = false;
 
 	while (!done) {
-		const res = (await ctx.helpers.httpRequestWithAuthentication(
+		const res = (await ctx.helpers.httpRequestWithAuthentication.call(
+			ctx,
 			'apifyApi',
 			{
 				method: 'GET',
