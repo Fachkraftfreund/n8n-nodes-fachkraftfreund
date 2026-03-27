@@ -7,7 +7,6 @@ import type {
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
-import { NodeOperationError } from 'n8n-workflow';
 
 const API_BASE = 'https://api.apify.com/v2';
 const ITEMS_PAGE_SIZE = 10_000;
@@ -178,43 +177,46 @@ interface ApifyListResponse<T> {
 async function getActors(
 	this: ILoadOptionsFunctions,
 ): Promise<INodePropertyOptions[]> {
-	let token: string;
-	try {
-		const creds = await this.getCredentials('apifyApi');
-		token = creds.apiToken as string;
-	} catch {
-		return [];
-	}
-
 	const seen = new Map<string, string>();
 	let offset = 0;
 
-	while (seen.size < 50) {
-		const res = (await this.helpers.httpRequest({
-			method: 'GET',
-			url: `${API_BASE}/actor-runs`,
-			qs: { token, limit: RUNS_PAGE_SIZE, offset, desc: true },
-			timeout: 15_000,
-		})) as ApifyListResponse<ApifyRun>;
+	try {
+		while (seen.size < 50) {
+			const res = (await this.helpers.httpRequestWithAuthentication.call(
+				this,
+				'apifyApi',
+				{
+					method: 'GET',
+					url: `${API_BASE}/actor-runs`,
+					qs: { limit: RUNS_PAGE_SIZE, offset, desc: true },
+					timeout: 15_000,
+				},
+			)) as ApifyListResponse<ApifyRun>;
 
-		const items = res?.data?.items ?? [];
-		if (items.length === 0) break;
-		for (const r of items) {
-			if (!seen.has(r.actId)) seen.set(r.actId, r.actId);
+			const items = res?.data?.items ?? [];
+			if (items.length === 0) break;
+			for (const r of items) {
+				if (!seen.has(r.actId)) seen.set(r.actId, r.actId);
+			}
+			offset += items.length;
+			if (offset >= (res?.data?.total ?? 0)) break;
 		}
-		offset += items.length;
-		if (offset >= (res?.data?.total ?? 0)) break;
+	} catch {
+		return [];
 	}
 
 	const entries = [...seen.keys()];
 	const settled = await Promise.allSettled(
 		entries.map(async (actId) => {
-			const act = (await this.helpers.httpRequest({
-				method: 'GET',
-				url: `${API_BASE}/acts/${actId}`,
-				qs: { token },
-				timeout: 10_000,
-			})) as { data?: { name?: string; title?: string; username?: string } };
+			const act = (await this.helpers.httpRequestWithAuthentication.call(
+				this,
+				'apifyApi',
+				{
+					method: 'GET',
+					url: `${API_BASE}/acts/${actId}`,
+					timeout: 10_000,
+				},
+			)) as { data?: { name?: string; title?: string; username?: string } };
 			const d = act?.data;
 			const label = d?.title || d?.name || actId;
 			const owner = d?.username ? ` (${d.username})` : '';
@@ -312,15 +314,6 @@ export class ApifyDataset implements INodeType {
 	methods = { loadOptions: { getActors } };
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-		const creds = await this.getCredentials('apifyApi');
-		const token = creds.apiToken as string;
-		if (!token) {
-			throw new NodeOperationError(
-				this.getNode(),
-				'Apify API token is required',
-			);
-		}
-
 		const startDate = this.getNodeParameter('startDate', 0) as string;
 		const options = this.getNodeParameter('options', 0, {}) as {
 			pageSize?: number;
@@ -346,7 +339,7 @@ export class ApifyDataset implements INodeType {
 			const mapper = MAPPERS[platform];
 
 			// Collect succeeded runs whose start date >= cutoff
-			const runs = await collectRuns(this, token, actorId, cutoffDate);
+			const runs = await collectRuns(this, actorId, cutoffDate);
 
 			// Fetch + map dataset items for each run
 			for (const run of runs) {
@@ -354,12 +347,15 @@ export class ApifyDataset implements INodeType {
 				let offset = 0;
 
 				while (true) {
-					const items = (await this.helpers.httpRequest({
-						method: 'GET',
-						url: dsUrl,
-						qs: { token, offset, limit: pageSize, format: 'json' },
-						timeout: 120_000,
-					})) as IDataObject[];
+					const items = (await this.helpers.httpRequestWithAuthentication(
+						'apifyApi',
+						{
+							method: 'GET',
+							url: dsUrl,
+							qs: { offset, limit: pageSize, format: 'json' },
+							timeout: 120_000,
+						},
+					)) as IDataObject[];
 
 					if (!Array.isArray(items) || items.length === 0) break;
 
@@ -410,7 +406,6 @@ export class ApifyDataset implements INodeType {
 
 async function collectRuns(
 	ctx: IExecuteFunctions,
-	token: string,
 	actorId: string,
 	cutoffDate: string,
 ): Promise<ApifyRun[]> {
@@ -419,12 +414,15 @@ async function collectRuns(
 	let done = false;
 
 	while (!done) {
-		const res = (await ctx.helpers.httpRequest({
-			method: 'GET',
-			url: `${API_BASE}/acts/${encodeURIComponent(actorId)}/runs`,
-			qs: { token, limit: RUNS_PAGE_SIZE, offset, desc: true },
-			timeout: 30_000,
-		})) as ApifyListResponse<ApifyRun>;
+		const res = (await ctx.helpers.httpRequestWithAuthentication(
+			'apifyApi',
+			{
+				method: 'GET',
+				url: `${API_BASE}/acts/${encodeURIComponent(actorId)}/runs`,
+				qs: { limit: RUNS_PAGE_SIZE, offset, desc: true },
+				timeout: 30_000,
+			},
+		)) as ApifyListResponse<ApifyRun>;
 
 		const runs = res?.data?.items ?? [];
 		if (runs.length === 0) break;
