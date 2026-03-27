@@ -1604,6 +1604,8 @@ function htmlToText(html: string): string {
 	);
 	text = text.replace(/<br\s*\/?>/gi, '\n');
 	text = text.replace(/<\/(?:td|th)>/gi, ' ');
+	// Preserve alt/title text from img tags before stripping (sites use <img alt="Fax"> icons)
+	text = text.replace(/<img\s[^>]*?\balt\s*=\s*["']([^"']*)["'][^>]*>/gi, ' $1 ');
 	text = text.replace(/<[^>]+>/g, ' ');
 	const entities: Record<string, string> = {
 		'&amp;': '&',
@@ -2401,9 +2403,9 @@ function htmlHasPlaceholderEmails(html: string): boolean {
 function extractPhones(businessText: string): string[] {
 	const found: string[] = [];
 	const patterns = [
-		/(?:Tel(?:efon)?|Phone|Fon)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/gi,
-		/(?:Tel(?:efon)?|Phone|Fon)\s+([+\d][\d\s/\-().]+\d)/gi,
-		/T\s*[.:]\s*([+\d][\d\s/\-().]+\d)/g,
+		/(?:Tel(?:efon)?|Phone|Fon)\s*[.:]+\s*([+\d][\d\s/\-\u2013\u2014().]+\d)/gi,
+		/(?:Tel(?:efon)?|Phone|Fon)\s+([+\d][\d\s/\-\u2013\u2014().]+\d)/gi,
+		/T\s*[.:]\s*([+\d][\d\s/\-\u2013\u2014().]+\d)/g,
 	];
 	for (const p of patterns) {
 		let m;
@@ -2418,8 +2420,8 @@ function extractPhones(businessText: string): string[] {
 function extractFaxNumbers(businessText: string): string[] {
 	const found: string[] = [];
 	const patterns = [
-		/(?:Fax|Telefax)\s*[.:]+\s*([+\d][\d\s/\-().]+\d)/gi,
-		/(?:Fax|Telefax)\s+([+\d][\d\s/\-().]+\d)/gi,
+		/(?:Fax|Telefax)\s*[.:]+\s*([+\d][\d\s/\-\u2013\u2014().]+\d)/gi,
+		/(?:Fax|Telefax)\s+([+\d][\d\s/\-\u2013\u2014().]+\d)/gi,
 	];
 	for (const p of patterns) {
 		let m;
@@ -2433,7 +2435,7 @@ function extractFaxNumbers(businessText: string): string[] {
 
 function extractMobileNumbers(businessText: string): string[] {
 	const found: string[] = [];
-	const regex = /(?:Mobil|Handy|Mobile)\s*[.:]\s*([+\d][\d\s/\-().]+\d)/gi;
+	const regex = /(?:Mobil|Handy|Mobile)\s*[.:]\s*([+\d][\d\s/\-\u2013\u2014().]+\d)/gi;
 	let m;
 	while ((m = regex.exec(businessText)) !== null) {
 		const raw = m[1].trim();
