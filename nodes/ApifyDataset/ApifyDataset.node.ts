@@ -338,7 +338,7 @@ export class ApifyDataset implements INodeType {
 
 			const mapper = MAPPERS[platform];
 
-			// Collect succeeded runs whose start date >= cutoff
+			// Collect runs whose start date >= cutoff (any status)
 			const runs = await collectRuns(this, actorId, cutoffDate);
 
 			// Fetch + map dataset items for each run
@@ -438,7 +438,6 @@ async function collectRuns(
 				break;
 			}
 
-			if (run.status !== 'SUCCEEDED') continue;
 			if (!run.defaultDatasetId) continue;
 			matching.push(run);
 		}
