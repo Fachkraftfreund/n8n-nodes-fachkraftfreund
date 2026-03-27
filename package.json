@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-fachkraftfreund",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "description": "n8n community nodes for Fachkraftfreund - WaliChat and Ringover integrations",
   "license": "MIT",
   "keywords": [
@@ -31,7 +31,8 @@
     ],
     "nodes": [
       "dist/nodes/ImpressumScraper/ImpressumScraper.node.js",
-      "dist/nodes/TeamKpiTracker/TeamKpiTracker.node.js"
+      "dist/nodes/TeamKpiTracker/TeamKpiTracker.node.js",
+      "dist/nodes/ApifyDataset/ApifyDataset.node.js"
     ]
   },
   "devDependencies": {
