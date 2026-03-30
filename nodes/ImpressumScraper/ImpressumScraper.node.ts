@@ -305,7 +305,7 @@ export class ImpressumScraper implements INodeType {
 		const bingJobs = jobs.filter((job) => {
 			if (job.error) return false;
 			const gr = jobGoogleResults.get(job);
-			if (!gr) return true;
+			if (!gr) return false; // No Google results entry → skip (shouldn't happen)
 			return gr.filtered.length === 0 || !hasLikelyOwnWebsite(gr.filtered, job.companyName, job.city);
 		});
 
@@ -316,14 +316,12 @@ export class ImpressumScraper implements INodeType {
 					batch.map(async (job) => {
 						const query = jobQueries.get(job) || job.companyName;
 						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing', searchTimeout);
-						const gr = jobGoogleResults.get(job);
-						if (gr) {
-							gr.all = [...gr.all, ...bingResults];
-							const bingFiltered = filterSearchResults(bingResults);
-							if (bingFiltered.length > 0) {
-								const seen = new Set(bingFiltered.map((r) => r.link));
-								gr.filtered = [...bingFiltered, ...gr.filtered.filter((r) => !seen.has(r.link))];
-							}
+						const gr = jobGoogleResults.get(job)!;
+						gr.all = [...gr.all, ...bingResults];
+						const bingFiltered = filterSearchResults(bingResults);
+						if (bingFiltered.length > 0) {
+							const seen = new Set(bingFiltered.map((r) => r.link));
+							gr.filtered = [...bingFiltered, ...gr.filtered.filter((r) => !seen.has(r.link))];
 						}
 					}),
 				);
