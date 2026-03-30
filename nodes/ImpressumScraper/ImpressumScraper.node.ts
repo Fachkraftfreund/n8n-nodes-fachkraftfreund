@@ -99,7 +99,7 @@ const HOMEPAGE_LINK_DIRECTORIES = [
 	'marktplatz-mittelstand.de', 'firmenabc.at',
 ];
 
-const HTTP_CONCURRENCY = 10;
+const HTTP_CONCURRENCY = 30;
 
 const USER_AGENT =
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -175,6 +175,14 @@ export class ImpressumScraper implements INodeType {
 				default: {},
 				options: [
 					{
+						displayName: 'Chunk Size',
+						name: 'chunkSize',
+						type: 'number',
+						default: 100,
+						description:
+							'Number of items to process through the full pipeline before moving to the next chunk. Lower values use less memory and recover faster from rate limits. Set to 0 to process all items at once (legacy behavior).',
+					},
+					{
 						displayName: 'Country Code',
 						name: 'country',
 						type: 'string',
@@ -242,23 +250,34 @@ export class ImpressumScraper implements INodeType {
 			tryCommonPaths?: boolean;
 			checkHomepage?: boolean;
 			country?: string;
+			chunkSize?: number;
 		};
 		const timeout = (options.timeout ?? 15) * 1000;
 		const searchTimeout = Math.max(timeout, 30000);
 		const tryCommonPaths = options.tryCommonPaths !== false;
 		const checkHomepage = options.checkHomepage !== false;
 		const country = options.country || 'de';
+		const chunkSize = (options.chunkSize ?? 100) > 0 ? (options.chunkSize ?? 100) : items.length;
 
-		// ── Initialize jobs ─────────────────────────────────────────
+		// ── Chunked processing: process N items through the full pipeline at a time ──
+		for (let chunkStart = 0; chunkStart < items.length; chunkStart += chunkSize) {
+		const chunkEnd = Math.min(chunkStart + chunkSize, items.length);
+
 		const jobs: ScrapeJob[] = [];
-		for (let i = 0; i < items.length; i++) {
+		for (let i = chunkStart; i < chunkEnd; i++) {
 			const companyName = this.getNodeParameter('companyName', i) as string;
 			const city = this.getNodeParameter('city', i) as string;
 			jobs.push({ itemIndex: i, companyName, city, inputUrl: '', normalizedUrl: '' });
 		}
 
-		// ── Phase 0: Search Google and resolve homepage URLs ─────────
-		const SEARCH_CONCURRENCY = 5;
+		// ── Phase 0a: Google search for all items ─────────────────
+		// Split search into sub-phases to avoid head-of-line blocking:
+		// a single item needing Google+Bing+OpenAI (3.5s) no longer blocks
+		// items that only need Google (1s).
+		const SEARCH_CONCURRENCY = 20;
+		const jobQueries = new Map<ScrapeJob, string>();
+		const jobGoogleResults = new Map<ScrapeJob, { all: SearchResult[]; filtered: SearchResult[] }>();
+
 		for (let i = 0; i < jobs.length; i += SEARCH_CONCURRENCY) {
 			const batch = jobs.slice(i, i + SEARCH_CONCURRENCY);
 			const settled = await Promise.allSettled(
@@ -268,75 +287,117 @@ export class ImpressumScraper implements INodeType {
 					const query = normalizedName.includes(normalizedCity)
 						? job.companyName
 						: `${job.companyName} ${job.city}`;
+					jobQueries.set(job, query);
 
-					// Search Google first
-					let allRawResults = await searchWeb(this, query, country, searchApiKey, 'google', searchTimeout);
-					let filtered = filterSearchResults(allRawResults);
-
-					// Bing fallback: if Google results don't seem to contain the company's own site
-					if (filtered.length === 0 || !hasLikelyOwnWebsite(filtered, job.companyName, job.city)) {
-						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing', searchTimeout);
-						allRawResults = [...allRawResults, ...bingResults];
-						const bingFiltered = filterSearchResults(bingResults);
-						if (bingFiltered.length > 0) {
-							// Merge: Bing results first (they found what Google missed), then Google
-							const seen = new Set(bingFiltered.map((r) => r.link));
-							filtered = [...bingFiltered, ...filtered.filter((r) => !seen.has(r.link))];
-						}
-					}
-
-					// Collect directory pages that may link to the actual homepage
-					const dirPages = allRawResults.filter((r) => {
-						try {
-							const hostname = new URL(r.link).hostname;
-							return HOMEPAGE_LINK_DIRECTORIES.some((d) => hostname.includes(d));
-						} catch { return false; }
-					});
-					const seenDir = new Set<string>();
-					job.directoryPages = dirPages.filter((r) => {
-						if (seenDir.has(r.link)) return false;
-						seenDir.add(r.link);
-						return true;
-					});
-
-					if (filtered.length === 0 && job.directoryPages.length === 0) {
-						job.error = `No search results found for "${job.companyName}" in "${job.city}"`;
-						return;
-					}
-
-					let homepageUrl: string | null = null;
-					if (openAiKey && filtered.length > 1) {
-						homepageUrl = await findHomepageWithOpenAi(this, query, filtered, openAiKey, openAiModel);
-					}
-					if (!homepageUrl && filtered.length > 0) {
-						homepageUrl = filtered[0].link;
-					}
-
-					// If we found a homepage via search, use it
-					if (homepageUrl) {
-						job.inputUrl = homepageUrl;
-						let normalizedUrl = homepageUrl.trim();
-						if (!/^https?:\/\//i.test(normalizedUrl)) {
-							normalizedUrl = 'https://' + normalizedUrl;
-						}
-						try {
-							new URL(normalizedUrl);
-						} catch {
-							job.error = `Invalid URL resolved from search: ${homepageUrl}`;
-							return;
-						}
-						job.normalizedUrl = normalizedUrl;
-					}
-					// Otherwise leave normalizedUrl empty — Phase 0b will try directory pages
+					const allRawResults = await searchWeb(this, query, country, searchApiKey, 'google', searchTimeout);
+					const filtered = filterSearchResults(allRawResults);
+					jobGoogleResults.set(job, { all: allRawResults, filtered });
 				}),
 			);
-
 			for (let j = 0; j < batch.length; j++) {
 				if (settled[j].status === 'rejected') {
 					batch[j].error = `Search failed: ${(settled[j] as PromiseRejectedResult).reason?.message || 'Unknown error'}`;
 				}
 			}
 		}
+
+		// ── Phase 0a2: Bing fallback for items that need it ───────
+		const bingJobs = jobs.filter((job) => {
+			if (job.error) return false;
+			const gr = jobGoogleResults.get(job);
+			if (!gr) return true;
+			return gr.filtered.length === 0 || !hasLikelyOwnWebsite(gr.filtered, job.companyName, job.city);
+		});
+
+		if (bingJobs.length > 0) {
+			for (let i = 0; i < bingJobs.length; i += SEARCH_CONCURRENCY) {
+				const batch = bingJobs.slice(i, i + SEARCH_CONCURRENCY);
+				await Promise.allSettled(
+					batch.map(async (job) => {
+						const query = jobQueries.get(job) || job.companyName;
+						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing', searchTimeout);
+						const gr = jobGoogleResults.get(job);
+						if (gr) {
+							gr.all = [...gr.all, ...bingResults];
+							const bingFiltered = filterSearchResults(bingResults);
+							if (bingFiltered.length > 0) {
+								const seen = new Set(bingFiltered.map((r) => r.link));
+								gr.filtered = [...bingFiltered, ...gr.filtered.filter((r) => !seen.has(r.link))];
+							}
+						}
+					}),
+				);
+			}
+		}
+
+		// ── Phase 0a3: Collect directory pages + resolve homepages ──
+		// First, extract directory pages and identify items needing OpenAI
+		const aiPickJobs: Array<{ job: ScrapeJob; query: string; filtered: SearchResult[] }> = [];
+
+		for (const job of jobs) {
+			if (job.error) continue;
+			const gr = jobGoogleResults.get(job);
+			if (!gr) continue;
+			const query = jobQueries.get(job) || job.companyName;
+
+			// Collect directory pages
+			const dirPages = gr.all.filter((r) => {
+				try {
+					const hostname = new URL(r.link).hostname;
+					return HOMEPAGE_LINK_DIRECTORIES.some((d) => hostname.includes(d));
+				} catch { return false; }
+			});
+			const seenDir = new Set<string>();
+			job.directoryPages = dirPages.filter((r) => {
+				if (seenDir.has(r.link)) return false;
+				seenDir.add(r.link);
+				return true;
+			});
+
+			if (gr.filtered.length === 0 && job.directoryPages.length === 0) {
+				job.error = `No search results found for "${job.companyName}" in "${job.city}"`;
+				continue;
+			}
+
+			// Items with >1 result need OpenAI to pick the homepage
+			if (openAiKey && gr.filtered.length > 1) {
+				aiPickJobs.push({ job, query, filtered: gr.filtered });
+			} else if (gr.filtered.length > 0) {
+				// Only one result — use it directly
+				const homepageUrl = gr.filtered[0].link;
+				job.inputUrl = homepageUrl;
+				let normalizedUrl = homepageUrl.trim();
+				if (!/^https?:\/\//i.test(normalizedUrl)) normalizedUrl = 'https://' + normalizedUrl;
+				try { new URL(normalizedUrl); job.normalizedUrl = normalizedUrl; }
+				catch { job.error = `Invalid URL resolved from search: ${homepageUrl}`; }
+			}
+		}
+
+		// ── Phase 0a4: OpenAI homepage selection (parallel) ──────
+		if (aiPickJobs.length > 0) {
+			for (let i = 0; i < aiPickJobs.length; i += OPENAI_CONCURRENCY) {
+				const batch = aiPickJobs.slice(i, i + OPENAI_CONCURRENCY);
+				await Promise.allSettled(
+					batch.map(async ({ job, query, filtered }) => {
+						let homepageUrl = await findHomepageWithOpenAi(this, query, filtered, openAiKey!, openAiModel);
+						if (!homepageUrl && filtered.length > 0) {
+							homepageUrl = filtered[0].link;
+						}
+						if (homepageUrl) {
+							job.inputUrl = homepageUrl;
+							let normalizedUrl = homepageUrl.trim();
+							if (!/^https?:\/\//i.test(normalizedUrl)) normalizedUrl = 'https://' + normalizedUrl;
+							try { new URL(normalizedUrl); job.normalizedUrl = normalizedUrl; }
+							catch { job.error = `Invalid URL resolved from search: ${homepageUrl}`; }
+						}
+					}),
+				);
+			}
+		}
+
+		// Clean up search result maps to free memory
+		jobQueries.clear();
+		jobGoogleResults.clear();
 
 		// ── Phase 0b: Directory homepage discovery (fallback) ──────
 		const jobsNeedingHomepage = jobs.filter(
@@ -464,37 +525,41 @@ export class ImpressumScraper implements INodeType {
 			}
 		}
 
-		// ── Phase 3: Try common paths (batch fetch all candidates) ──
+		// ── Phase 3: Try common paths (wave-based: stop early per item) ──
 		if (tryCommonPaths) {
-			const jobsNeedingPaths = jobsWithHomepage.filter((j) => !j.impressumUrl);
+			let jobsNeedingPaths = jobsWithHomepage.filter((j) => !j.impressumUrl);
 
-			if (jobsNeedingPaths.length > 0) {
-				const candidates: Array<{ url: string; jobIdx: number }> = [];
-				for (let ji = 0; ji < jobsNeedingPaths.length; ji++) {
-					const base = new URL(
-						jobsNeedingPaths[ji].homepageFinalUrl || jobsNeedingPaths[ji].normalizedUrl,
-					);
-					for (const path of COMMON_IMPRESSUM_PATHS) {
-						candidates.push({ url: new URL(path, base).href, jobIdx: ji });
-					}
+			for (const path of COMMON_IMPRESSUM_PATHS) {
+				if (jobsNeedingPaths.length === 0) break;
+
+				const urlToJobs = new Map<string, ScrapeJob[]>();
+				for (const job of jobsNeedingPaths) {
+					try {
+						const base = new URL(job.homepageFinalUrl || job.normalizedUrl);
+						const url = new URL(path, base).href;
+						const list = urlToJobs.get(url) || [];
+						list.push(job);
+						urlToJobs.set(url, list);
+					} catch { /* skip invalid */ }
 				}
 
-				const uniqueUrls = [...new Set(candidates.map((c) => c.url))];
-				const candidateResults = await fetchMany(this, uniqueUrls, timeout, apifyToken);
+				const waveResults = await fetchMany(this, [...urlToJobs.keys()], timeout, apifyToken);
 
-				for (const { url, jobIdx } of candidates) {
-					const job = jobsNeedingPaths[jobIdx];
-					if (job.impressumUrl) continue;
-
-					const result = candidateResults.get(url);
+				for (const [url, jobList] of urlToJobs) {
+					const result = waveResults.get(url);
 					if (result && result.html.length > 500) {
 						const text = htmlToText(result.html);
 						if (looksLikeImpressum(text)) {
-							job.impressumUrl = url;
-							job.impressumHtml = result.html;
+							for (const job of jobList) {
+								job.impressumUrl = url;
+								job.impressumHtml = result.html;
+							}
 						}
 					}
 				}
+
+				// Only keep items that still need an impressum for the next wave
+				jobsNeedingPaths = jobsNeedingPaths.filter((j) => !j.impressumUrl);
 			}
 		}
 
@@ -719,13 +784,15 @@ export class ImpressumScraper implements INodeType {
 			await normalizePhoneNumbers(this, successfulJobs, openAiKey, openAiModel);
 		}
 
-		// ── Push final results ──────────────────────────────────────
+		// ── Push chunk results ──────────────────────────────────────
 		for (const { job, data } of successfulJobs) {
 			returnData.push({
 				json: { inputCompanyName: job.companyName, inputCity: job.city, ...data, success: true },
 				pairedItem: { item: job.itemIndex },
 			});
 		}
+
+		} // ── end chunk loop ─────────────────────────────────────────
 
 		returnData.sort((a, b) => (a.pairedItem as { item: number }).item - (b.pairedItem as { item: number }).item);
 		return [returnData];
@@ -849,6 +916,7 @@ async function fetchManyApify(
 			method: 'GET',
 			url: 'https://api.apify.com/v2/users/me/limits',
 			qs: { token: apifyToken },
+			timeout: 15000,
 		});
 		const maxGb = limitsResp?.data?.maxActorMemoryGbytes;
 		if (maxGb && maxGb > 0) {
@@ -891,6 +959,7 @@ async function fetchManyApify(
 					maxRequestsPerCrawl: chunk.length,
 					pageFunction,
 				},
+				timeout: 30000,
 			}),
 		),
 	);
@@ -919,6 +988,7 @@ async function fetchManyApify(
 					method: 'GET',
 					url: `https://api.apify.com/v2/actor-runs/${runId}`,
 					qs: { token: apifyToken },
+					timeout: 15000,
 				}),
 			),
 		);
@@ -945,6 +1015,7 @@ async function fetchManyApify(
 				method: 'GET',
 				url: `https://api.apify.com/v2/actor-runs/${runId}/dataset/items`,
 				qs: { token: apifyToken },
+				timeout: 60000,
 			}),
 		),
 	);
@@ -999,6 +1070,7 @@ async function fetchWithJsApify(
 				maxRequestsPerCrawl: urls.length,
 				pageFunction,
 			},
+			timeout: 30000,
 		});
 	} catch {
 		return results;
@@ -1019,6 +1091,7 @@ async function fetchWithJsApify(
 				method: 'GET',
 				url: `https://api.apify.com/v2/actor-runs/${runId}`,
 				qs: { token: apifyToken },
+				timeout: 15000,
 			});
 			const status = statusResp?.data?.status;
 			if (['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT'].includes(status)) {
@@ -1036,6 +1109,7 @@ async function fetchWithJsApify(
 			method: 'GET',
 			url: `https://api.apify.com/v2/actor-runs/${runId}/dataset/items`,
 			qs: { token: apifyToken },
+			timeout: 60000,
 		});
 		if (Array.isArray(items)) {
 			for (const item of items) {
@@ -1219,7 +1293,7 @@ const EXTRACTABLE_FIELDS: Record<string, string> = {
 	managingDirector: 'Managing director (Geschäftsführer/in)',
 };
 
-const OPENAI_CONCURRENCY = 5;
+const OPENAI_CONCURRENCY = 15;
 
 const ARRAY_FIELDS = new Set(['emails', 'phones', 'faxNumbers', 'mobileNumbers']);
 
