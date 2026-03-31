@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-fachkraftfreund",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "n8n community nodes for Fachkraftfreund - WaliChat and Ringover integrations",
   "license": "MIT",
   "keywords": [

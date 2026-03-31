@@ -155,38 +155,48 @@ export class ChunkedSubworkflow implements INodeType {
 
 		const chunks = chunkArray(items, chunkSize);
 		const totalChunks = chunks.length;
-		const allResults: INodeExecutionData[] = [];
+		const results: INodeExecutionData[][] = new Array(totalChunks);
 
-		for (
-			let batchStart = 0;
-			batchStart < totalChunks;
-			batchStart += maxConcurrency
-		) {
-			const batch = chunks.slice(batchStart, batchStart + maxConcurrency);
+		let nextIdx = 0;
+		let running = 0;
+		let settled = false;
+		let resolve: () => void;
+		let reject: (err: Error) => void;
+		const done = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
 
-			const batchPromises = batch.map(async (chunk, batchIdx) => {
-				const chunkIdx = batchStart + batchIdx;
-				try {
-					const result = await this.executeWorkflow(
-						{ id: workflowId },
-						chunk,
-					);
-					return flattenWorkflowOutput(result.data);
-				} catch (error) {
-					if (error instanceof NodeOperationError) throw error;
-					throw new NodeOperationError(
-						this.getNode(),
-						`Chunk ${chunkIdx + 1}/${totalChunks} failed: ${(error as Error).message}`,
-					);
-				}
-			});
-
-			const batchResults = await Promise.all(batchPromises);
-			for (const chunkResult of batchResults) {
-				allResults.push(...chunkResult);
+		const runNext = () => {
+			if (settled) return;
+			while (running < maxConcurrency && nextIdx < totalChunks) {
+				const chunkIdx = nextIdx++;
+				running++;
+				this.executeWorkflow({ id: workflowId }, chunks[chunkIdx])
+					.then((result) => {
+						results[chunkIdx] = flattenWorkflowOutput(result.data);
+					})
+					.catch((error) => {
+						if (!settled) {
+							settled = true;
+							const message = `Chunk ${chunkIdx + 1}/${totalChunks} failed: ${(error as Error).message}`;
+							reject(error instanceof NodeOperationError
+								? error
+								: new NodeOperationError(this.getNode(), message));
+						}
+					})
+					.finally(() => {
+						running--;
+						if (!settled && nextIdx >= totalChunks && running === 0) {
+							settled = true;
+							resolve();
+						} else {
+							runNext();
+						}
+					});
 			}
-		}
+		};
 
-		return [allResults];
+		runNext();
+		if (totalChunks > 0) await done;
+
+		return [results.flat()];
 	}
 }
