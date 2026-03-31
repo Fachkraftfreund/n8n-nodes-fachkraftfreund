@@ -306,6 +306,24 @@ export class ApifyDataset implements INodeType {
 							'Number of dataset items fetched per API request',
 						typeOptions: { minValue: 1, maxValue: 999_999 },
 					},
+					{
+						displayName: 'Offset',
+						name: 'offset',
+						type: 'number',
+						default: 0,
+						description:
+							'Number of raw dataset items to skip (across all datasets). Use with Limit to chunk large result sets across multiple executions.',
+						typeOptions: { minValue: 0 },
+					},
+					{
+						displayName: 'Limit',
+						name: 'limit',
+						type: 'number',
+						default: 0,
+						description:
+							'Maximum number of raw dataset items to fetch (0 = unlimited). Use with Offset to chunk large result sets.',
+						typeOptions: { minValue: 0 },
+					},
 				],
 			},
 		],
@@ -317,8 +335,12 @@ export class ApifyDataset implements INodeType {
 		const startDate = this.getNodeParameter('startDate', 0) as string;
 		const options = this.getNodeParameter('options', 0, {}) as {
 			pageSize?: number;
+			offset?: number;
+			limit?: number;
 		};
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
+		const globalOffset = options.offset ?? 0;
+		const globalLimit = options.limit ?? 0; // 0 = unlimited
 
 		// Use calendar-date comparison (YYYY-MM-DD) to avoid timezone edge cases
 		const cutoffDate = new Date(startDate).toISOString().slice(0, 10);
@@ -329,57 +351,92 @@ export class ApifyDataset implements INodeType {
 			{ param: 'stepstoneActorId', platform: 'stepstone' },
 		];
 
-		// Collect all mapped jobs, grouped by normalized company name
-		const jobsByCompany = new Map<string, IDataObject[]>();
+		// Step 1: Collect all runs across all platforms in deterministic order
+		const datasets: { datasetId: string; platform: Platform }[] = [];
 
 		for (const { param, platform } of platforms) {
 			const actorId = this.getNodeParameter(param, 0) as string;
 			if (!actorId) continue;
-
-			const mapper = MAPPERS[platform];
-
-			// Collect runs whose start date >= cutoff (any status)
 			const runs = await collectRuns(this, actorId, cutoffDate);
-
-			// Fetch + map dataset items for each run
 			for (const run of runs) {
-				const dsUrl = `${API_BASE}/datasets/${run.defaultDatasetId}/items`;
-				let offset = 0;
-
-				while (true) {
-					const items = (await this.helpers.httpRequestWithAuthentication.call(
-						this,
-						'apifyApi',
-						{
-							method: 'GET',
-							url: dsUrl,
-							qs: { offset, limit: pageSize, format: 'json' },
-							timeout: 120_000,
-						},
-					)) as IDataObject[];
-
-					if (!Array.isArray(items) || items.length === 0) break;
-
-					for (const raw of items) {
-						const mapped = mapper(raw);
-						if (mapped === null) continue;
-
-						const name = mapped.company_name as string | undefined;
-						if (!name) continue;
-
-						const key = normalize(name) ?? '';
-						let group = jobsByCompany.get(key);
-						if (!group) {
-							group = [];
-							jobsByCompany.set(key, group);
-						}
-						group.push(mapped);
-					}
-
-					offset += items.length;
-					if (items.length < pageSize) break;
-				}
+				datasets.push({ datasetId: run.defaultDatasetId, platform });
 			}
+		}
+
+		// Step 2: Fetch item counts for all datasets (parallel)
+		const itemCounts = await Promise.all(
+			datasets.map((ds) => getDatasetItemCount(this, ds.datasetId)),
+		);
+		const totalItemCount = itemCounts.reduce((a, b) => a + b, 0);
+
+		// Step 3: Fetch only the datasets (or slices) that fall within offset/limit
+		const jobsByCompany = new Map<string, IDataObject[]>();
+		let cumulative = 0;
+		let fetched = 0;
+		const effectiveLimit = globalLimit > 0 ? globalLimit : Infinity;
+
+		for (let i = 0; i < datasets.length; i++) {
+			if (fetched >= effectiveLimit) break;
+
+			const dsItemCount = itemCounts[i];
+
+			// Skip dataset entirely if it falls before the offset
+			if (cumulative + dsItemCount <= globalOffset) {
+				cumulative += dsItemCount;
+				continue;
+			}
+
+			const ds = datasets[i];
+			const mapper = MAPPERS[ds.platform];
+
+			// Calculate offset within this dataset and how many items to read
+			const dsOffset = Math.max(0, globalOffset - cumulative);
+			const remaining = effectiveLimit - fetched;
+			const dsLimit = Math.min(remaining, dsItemCount - dsOffset);
+
+			// Fetch items from this dataset with calculated offset/limit
+			const dsUrl = `${API_BASE}/datasets/${ds.datasetId}/items`;
+			let localOffset = dsOffset;
+			let localFetched = 0;
+
+			while (localFetched < dsLimit) {
+				const fetchLimit = Math.min(pageSize, dsLimit - localFetched);
+				const items = (await this.helpers.httpRequestWithAuthentication.call(
+					this,
+					'apifyApi',
+					{
+						method: 'GET',
+						url: dsUrl,
+						qs: { offset: localOffset, limit: fetchLimit, format: 'json' },
+						timeout: 120_000,
+					},
+				)) as IDataObject[];
+
+				if (!Array.isArray(items) || items.length === 0) break;
+
+				for (const raw of items) {
+					const mapped = mapper(raw);
+					if (mapped === null) continue;
+
+					const name = mapped.company_name as string | undefined;
+					if (!name) continue;
+
+					const key = normalize(name) ?? '';
+					let group = jobsByCompany.get(key);
+					if (!group) {
+						group = [];
+						jobsByCompany.set(key, group);
+					}
+					group.push(mapped);
+				}
+
+				localOffset += items.length;
+				localFetched += items.length;
+				if (items.length < fetchLimit) break;
+			}
+
+			fetched += localFetched;
+			cumulative += dsItemCount;
 		}
 
 		// Build one output item per company
@@ -395,12 +452,38 @@ export class ApifyDataset implements INodeType {
 						normalized_city: normalize(first.city as string | undefined),
 					},
 					jobs,
+					totalItemCount,
 				},
+			});
+		}
+
+		// If no companies found, still output pagination info
+		if (returnData.length === 0) {
+			returnData.push({
+				json: { company: null, jobs: [], totalItemCount },
 			});
 		}
 
 		return [returnData];
 	}
+}
+
+// ─── Dataset metadata ────────────────────────────────────────────────────────
+
+async function getDatasetItemCount(
+	ctx: IExecuteFunctions,
+	datasetId: string,
+): Promise<number> {
+	const res = (await ctx.helpers.httpRequestWithAuthentication.call(
+		ctx,
+		'apifyApi',
+		{
+			method: 'GET',
+			url: `${API_BASE}/datasets/${datasetId}`,
+			timeout: 10_000,
+		},
+	)) as { data?: { itemCount?: number } };
+	return res?.data?.itemCount ?? 0;
 }
 
 // ─── Run collection ──────────────────────────────────────────────────────────
