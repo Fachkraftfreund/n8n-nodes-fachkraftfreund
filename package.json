@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-fachkraftfreund",
-  "version": "0.4.10",
+  "version": "0.5.0",
   "description": "n8n community nodes for Fachkraftfreund - WaliChat and Ringover integrations",
   "license": "MIT",
   "keywords": [
@@ -27,12 +27,14 @@
       "dist/credentials/ApifyApi.credentials.js",
       "dist/credentials/OpenAiApi.credentials.js",
       "dist/credentials/SearchApi.credentials.js",
-      "dist/credentials/BullhornApi.credentials.js"
+      "dist/credentials/BullhornApi.credentials.js",
+      "dist/credentials/N8nApi.credentials.js"
     ],
     "nodes": [
       "dist/nodes/ImpressumScraper/ImpressumScraper.node.js",
       "dist/nodes/TeamKpiTracker/TeamKpiTracker.node.js",
-      "dist/nodes/ApifyDataset/ApifyDataset.node.js"
+      "dist/nodes/ApifyDataset/ApifyDataset.node.js",
+      "dist/nodes/ChunkedSubworkflow/ChunkedSubworkflow.node.js"
     ]
   },
   "devDependencies": {
