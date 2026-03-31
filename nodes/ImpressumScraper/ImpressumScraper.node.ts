@@ -681,6 +681,9 @@ export class ImpressumScraper implements INodeType {
 			}
 		}
 
+		// Free fallbackText — no longer needed after Phase 5 parsing
+		for (const job of jobs) job.fallbackText = undefined;
+
 		// ── Phase 5b: Fill gaps from homepage HTML ──────────────────
 		for (const { job, data } of successfulJobs) {
 			if (!job.homepageHtml) continue;
@@ -757,10 +760,20 @@ export class ImpressumScraper implements INodeType {
 			}
 		}
 
+		// Free HTML strings — no longer needed after Phase 5c
+		// For 10k items this reclaims ~2GB; even with chunking it reduces peak memory
+		for (const job of jobs) {
+			job.homepageHtml = undefined;
+			job.impressumHtml = undefined;
+		}
+
 		// ── Phase 6: Plausibility check + OpenAI enrichment ─────────
 		if (openAiKey && successfulJobs.length > 0) {
 			await enrichWithOpenAi(this, successfulJobs, openAiKey, openAiModel);
 		}
+
+		// Free impressum text — no longer needed after enrichment
+		for (const entry of successfulJobs) (entry as { text: string | undefined }).text = undefined;
 
 		// ── Phase 7: Derive salutation from firstName via OpenAI ───
 		if (openAiKey && successfulJobs.length > 0) {
