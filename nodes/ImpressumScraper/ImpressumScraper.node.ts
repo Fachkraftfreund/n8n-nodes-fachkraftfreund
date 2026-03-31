@@ -129,7 +129,7 @@ export class ImpressumScraper implements INodeType {
 				required: true,
 			},
 			{
-				name: 'apifyApi',
+				name: 'fachkraftfreundApifyApi',
 				required: false,
 			},
 			{
@@ -233,7 +233,7 @@ export class ImpressumScraper implements INodeType {
 
 		let apifyToken: string | undefined;
 		try {
-			const creds = await this.getCredentials('apifyApi');
+			const creds = await this.getCredentials('fachkraftfreundApifyApi');
 			apifyToken = creds.apiToken as string;
 		} catch { /* not configured */ }
 

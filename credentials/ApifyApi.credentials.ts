@@ -6,8 +6,8 @@ import {
 } from 'n8n-workflow';
 
 export class ApifyApi implements ICredentialType {
-	name = 'apifyApi';
-	displayName = 'Apify API';
+	name = 'fachkraftfreundApifyApi';
+	displayName = 'Apify API (Fachkraftfreund)';
 	documentationUrl = 'https://docs.apify.com/platform/integrations/api';
 
 	properties: INodeProperties[] = [
