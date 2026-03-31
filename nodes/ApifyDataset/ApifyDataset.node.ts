@@ -150,6 +150,35 @@ function mapStepstone(r: IDataObject): IDataObject | null {
 	};
 }
 
+function isFilteredCompany(name: string): boolean {
+	const lower = name.toLowerCase();
+	return (
+		// Government / institutional
+		lower.includes('bundesagentur') ||
+		lower.includes('arbeitsagentur') ||
+		lower.includes('jobcenter') ||
+		name.includes('Gemeinde') ||
+		name.includes('Stadt') ||
+		lower.includes('landkreis ') ||
+		lower.includes('landesamt') ||
+		lower.includes('bezirksamt') ||
+		lower.includes('staatsanwaltschaft') ||
+		lower.includes('bundeswehr') ||
+		name.includes('Verein') ||
+		name.includes('Kanton') ||
+		name.includes('Universität') ||
+		// Staffing / recruitment agencies & hospital chains
+		lower.includes('personal') ||
+		lower.includes('recruit') ||
+		lower.includes('zeitarbeit') ||
+		lower.includes('leiharbeit') ||
+		lower.includes('randstad') ||
+		lower.includes('schön klinik') ||
+		lower.includes('asklepios') ||
+		lower.includes('helios')
+	);
+}
+
 type Platform = 'arbeitsamt' | 'indeed' | 'stepstone';
 const MAPPERS: Record<Platform, (r: IDataObject) => IDataObject | null> = {
 	arbeitsamt: mapArbeitsamt,
@@ -306,6 +335,14 @@ export class ApifyDataset implements INodeType {
 							'Number of dataset items fetched per API request',
 						typeOptions: { minValue: 1, maxValue: 999_999 },
 					},
+					{
+						displayName: 'Return Single Item',
+						name: 'returnSingleItem',
+						type: 'boolean',
+						default: false,
+						description:
+							'Whether to return all companies in a single item instead of one item per company',
+					},
 				],
 			},
 		],
@@ -317,8 +354,10 @@ export class ApifyDataset implements INodeType {
 		const startDate = this.getNodeParameter('startDate', 0) as string;
 		const options = this.getNodeParameter('options', 0, {}) as {
 			pageSize?: number;
+			returnSingleItem?: boolean;
 		};
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
+		const returnSingleItem = options.returnSingleItem ?? false;
 
 		// Use calendar-date comparison (YYYY-MM-DD) to avoid timezone edge cases
 		const cutoffDate = new Date(startDate).toISOString().slice(0, 10);
@@ -331,6 +370,8 @@ export class ApifyDataset implements INodeType {
 
 		// Collect all mapped jobs, grouped by normalized company name
 		const jobsByCompany = new Map<string, IDataObject[]>();
+		// Cache filtered company keys to skip them in O(1) on subsequent jobs
+		const filteredKeys = new Set<string>();
 
 		for (const { param, platform } of platforms) {
 			const actorId = this.getNodeParameter(param, 0) as string;
@@ -368,6 +409,16 @@ export class ApifyDataset implements INodeType {
 						if (!name) continue;
 
 						const key = normalize(name) ?? '';
+
+						// Skip companies that were already filtered out
+						if (filteredKeys.has(key)) continue;
+
+						// Filter on first encounter, cache the result
+						if (!jobsByCompany.has(key) && isFilteredCompany(name)) {
+							filteredKeys.add(key);
+							continue;
+						}
+
 						let group = jobsByCompany.get(key);
 						if (!group) {
 							group = [];
@@ -382,23 +433,27 @@ export class ApifyDataset implements INodeType {
 			}
 		}
 
-		// Build one output item per company
-		const returnData: INodeExecutionData[] = [];
+		// Build output: one item per company, or all companies in a single item
+		const companies: IDataObject[] = [];
 		for (const [normalizedName, jobs] of jobsByCompany) {
 			const first = jobs[0];
-			returnData.push({
-				json: {
-					company: {
-						name: first.company_name,
-						city: first.city ?? null,
-						normalized_name: normalizedName,
-						normalized_city: normalize(first.city as string | undefined),
-					},
-					jobs,
+			companies.push({
+				company: {
+					name: first.company_name,
+					city: first.city ?? null,
+					normalized_name: normalizedName,
+					normalized_city: normalize(first.city as string | undefined),
 				},
+				jobs,
 			});
 		}
+		jobsByCompany.clear();
 
+		if (returnSingleItem) {
+			return [[{ json: { companies } }]];
+		}
+
+		const returnData: INodeExecutionData[] = companies.map((c) => ({ json: c }));
 		return [returnData];
 	}
 }
