@@ -795,8 +795,9 @@ export class ImpressumScraper implements INodeType {
 			await normalizePhoneNumbers(this, successfulJobs, openAiKey, openAiModel);
 		}
 
-		// ── Push chunk results ──────────────────────────────────────
+		// ── Sanitize and push chunk results ─────────────────────────
 		for (const { job, data } of successfulJobs) {
+			sanitizeResult(data);
 			returnData.push({
 				json: { inputCompanyName: job.companyName, inputCity: job.city, ...data, success: true },
 				pairedItem: { item: job.itemIndex },
@@ -1751,6 +1752,30 @@ function htmlToText(html: string): string {
 		.join('\n');
 	text = text.replace(/\n{3,}/g, '\n\n');
 	return text.trim();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Result Sanitization
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function sanitizeString(value: string): string {
+	return value
+		.replace(/\x00/g, '')                // null bytes
+		.replace(/\\u[0-9a-fA-F]{4}/g, '')   // unicode escape sequences
+		.replace(/\\/g, '');                  // stray backslashes
+}
+
+function sanitizeResult(data: ImpressumResult): void {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const d = data as any;
+	for (const key of Object.keys(d)) {
+		const val = d[key];
+		if (typeof val === 'string') {
+			d[key] = sanitizeString(val);
+		} else if (Array.isArray(val)) {
+			d[key] = val.map((v: unknown) => typeof v === 'string' ? sanitizeString(v) : v);
+		}
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
