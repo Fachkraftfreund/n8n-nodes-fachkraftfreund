@@ -1678,11 +1678,41 @@ function looksLikeImpressum(text: string): boolean {
 // HTML to Text
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Removes all occurrences of <tagName ...>...</tagName> from the string.
+ * Uses iterative indexOf instead of [\s\S]*? regex to avoid V8 stack overflow
+ * on very large HTML strings (pages with huge inline SVGs, base64 data, etc.).
+ */
+function stripTagBlocks(text: string, tagName: string): string {
+	const open = `<${tagName}`;
+	const close = `</${tagName}>`;
+	const lower = text.toLowerCase();
+	let result = '';
+	let pos = 0;
+
+	while (pos < text.length) {
+		const start = lower.indexOf(open, pos);
+		if (start === -1) {
+			result += text.substring(pos);
+			break;
+		}
+		result += text.substring(pos, start);
+		const end = lower.indexOf(close, start);
+		if (end === -1) {
+			// No closing tag — discard rest
+			break;
+		}
+		pos = end + close.length;
+	}
+	return result;
+}
+
 function htmlToText(html: string): string {
-	let text = html;
-	text = text.replace(/<script[\s\S]*?<\/script>/gi, '');
-	text = text.replace(/<style[\s\S]*?<\/style>/gi, '');
-	text = text.replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
+	// Cap input size — pages with huge inline SVGs/base64 can exceed V8 regex stack limits
+	let text = html.length > 2_000_000 ? html.substring(0, 2_000_000) : html;
+	text = stripTagBlocks(text, 'script');
+	text = stripTagBlocks(text, 'style');
+	text = stripTagBlocks(text, 'noscript');
 	text = text.replace(
 		/<\/(?:p|div|h[1-6]|li|tr|section|article|header|footer|main|aside|nav)>/gi,
 		'\n',
