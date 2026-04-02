@@ -3,6 +3,7 @@ import {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
+	NodeOperationError,
 } from 'n8n-workflow';
 import { getOpenAiModels } from '../shared/openai-models';
 
@@ -117,7 +118,7 @@ export class ImpressumScraper implements INodeType {
 		version: 1,
 		subtitle: 'Find company homepage & scrape Impressum',
 		description:
-			'Searches for a company by name and city, finds the homepage via Google, then crawls the website to extract structured Impressum/legal data.',
+			'Searches for a company by name (and optionally city), finds the homepage via Google, then crawls the website to extract structured Impressum/legal data.',
 		defaults: {
 			name: 'Impressum Scraper',
 		},
@@ -152,8 +153,7 @@ export class ImpressumScraper implements INodeType {
 				name: 'city',
 				type: 'string',
 				default: '',
-				required: true,
-				description: 'The city where the company is located',
+				description: 'The city where the company is located (optional – improves search accuracy)',
 				placeholder: 'Berlin',
 			},
 			{
@@ -296,7 +296,14 @@ export class ImpressumScraper implements INodeType {
 			);
 			for (let j = 0; j < batch.length; j++) {
 				if (settled[j].status === 'rejected') {
-					batch[j].error = `Search failed: ${(settled[j] as PromiseRejectedResult).reason?.message || 'Unknown error'}`;
+					const reason = (settled[j] as PromiseRejectedResult).reason;
+					if (isQuotaError(reason)) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`SearchAPI quota exhausted (HTTP 429). Check your SearchAPI plan or wait before retrying.`,
+						);
+					}
+					batch[j].error = `Search failed: ${reason?.message || 'Unknown error'}`;
 				}
 			}
 		}
@@ -312,7 +319,7 @@ export class ImpressumScraper implements INodeType {
 		if (bingJobs.length > 0) {
 			for (let i = 0; i < bingJobs.length; i += SEARCH_CONCURRENCY) {
 				const batch = bingJobs.slice(i, i + SEARCH_CONCURRENCY);
-				await Promise.allSettled(
+				const bingSettled = await Promise.allSettled(
 					batch.map(async (job) => {
 						const query = jobQueries.get(job) || job.companyName;
 						const bingResults = await searchWeb(this, query, country, searchApiKey, 'bing', searchTimeout);
@@ -325,6 +332,14 @@ export class ImpressumScraper implements INodeType {
 						}
 					}),
 				);
+				for (const s of bingSettled) {
+					if (s.status === 'rejected' && isQuotaError(s.reason)) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`SearchAPI quota exhausted (HTTP 429). Check your SearchAPI plan or wait before retrying.`,
+						);
+					}
+				}
 			}
 		}
 
@@ -353,7 +368,9 @@ export class ImpressumScraper implements INodeType {
 			});
 
 			if (gr.filtered.length === 0 && job.directoryPages.length === 0) {
-				job.error = `No search results found for "${job.companyName}" in "${job.city}"`;
+				job.error = job.city
+					? `No search results found for "${job.companyName}" in "${job.city}"`
+					: `No search results found for "${job.companyName}"`;
 				continue;
 			}
 
@@ -433,7 +450,9 @@ export class ImpressumScraper implements INodeType {
 					}
 				}
 				if (!job.normalizedUrl) {
-					job.error = `No homepage found for "${job.companyName}" in "${job.city}" (checked ${dirUrls.length} directory pages)`;
+					job.error = job.city
+						? `No homepage found for "${job.companyName}" in "${job.city}" (checked ${dirUrls.length} directory pages)`
+						: `No homepage found for "${job.companyName}" (checked ${dirUrls.length} directory pages)`;
 				}
 			}
 		}
@@ -485,7 +504,9 @@ export class ImpressumScraper implements INodeType {
 		// Mark remaining jobs with no homepage and no error
 		for (const job of jobs) {
 			if (!job.error && !job.normalizedUrl) {
-				job.error = `No homepage found for "${job.companyName}" in "${job.city}"`;
+				job.error = job.city
+					? `No homepage found for "${job.companyName}" in "${job.city}"`
+					: `No homepage found for "${job.companyName}"`;
 			}
 		}
 
@@ -978,6 +999,12 @@ async function fetchManyApify(
 
 	const runIds: string[] = [];
 	for (const resp of startResponses) {
+		if (resp.status === 'rejected' && isQuotaError(resp.reason)) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`Apify budget depleted. Check your Apify subscription or wait for the budget to reset.`,
+			);
+		}
 		if (resp.status === 'fulfilled' && resp.value?.data?.id) {
 			runIds.push(resp.value.data.id);
 		}
@@ -1084,7 +1111,13 @@ async function fetchWithJsApify(
 			},
 			timeout: 30000,
 		});
-	} catch {
+	} catch (err) {
+		if (isQuotaError(err)) {
+			throw new NodeOperationError(
+				ctx.getNode(),
+				`Apify budget depleted. Check your Apify subscription or wait for the budget to reset.`,
+			);
+		}
 		return results;
 	}
 
@@ -1135,6 +1168,20 @@ async function fetchWithJsApify(
 	}
 
 	return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Quota / rate-limit detection
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function isQuotaError(err: unknown): boolean {
+	if (!err) return false;
+	const msg = (err as Error)?.message || String(err);
+	if (/status code 429/i.test(msg)) return true;
+	if (/status code 402/i.test(msg)) return true;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const code = (err as any)?.statusCode ?? (err as any)?.response?.status;
+	return code === 429 || code === 402;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1190,7 +1237,7 @@ function hasLikelyOwnWebsite(results: SearchResult[], companyName: string, city:
 	// Skip generic words that don't help identify a specific company's domain
 	const SKIP = /^(zahnarzt|praxis|zahnarztpraxis|kieferorthopaedie|kiefer|orthopaede|arzt|arztpraxis|klinik|zentrum|institut|gmbh|gbr|ohg|ug|dr|prof|med|dent|dipl|und|am|im|an|der|die|das|den|dem|fuer|von|zu|zur|zum)$/;
 
-	const keywords = [...normalize(companyName).split(/\s+/), ...normalize(city).split(/\s+/)]
+	const keywords = [...normalize(companyName).split(/\s+/), ...(city ? normalize(city).split(/\s+/) : [])]
 		.filter((w) => w.length >= 3 && !SKIP.test(w));
 
 	if (keywords.length === 0) return false;
@@ -2779,9 +2826,9 @@ async function guessDomains(
 					{
 						role: 'system',
 						content:
-							'You are a German business website domain guesser. Given a company name and city, guess the most likely website domains. German businesses typically use patterns like:\n' +
+							'You are a German business website domain guesser. Given a company name' + (city ? ' and city' : '') + ', guess the most likely website domains. German businesses typically use patterns like:\n' +
 							'- company-name.de (e.g. "lange-und-rakhimov.de")\n' +
-							'- company-name-city.de (e.g. "zahnarzt-roeder-dresden.de")\n' +
+							(city ? '- company-name-city.de (e.g. "zahnarzt-roeder-dresden.de")\n' : '') +
 							'- zahnarztpraxis-lastname.de\n' +
 							'- zahnarzt-lastname.de\n' +
 							'- praxis-lastname.de\n\n' +
@@ -2795,7 +2842,7 @@ async function guessDomains(
 					},
 					{
 						role: 'user',
-						content: `Company: ${companyName}\nCity: ${city}`,
+						content: city ? `Company: ${companyName}\nCity: ${city}` : `Company: ${companyName}`,
 					},
 				],
 			},
