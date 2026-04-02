@@ -359,9 +359,9 @@ export class ApifyDataset implements INodeType {
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
 		const returnSingleItem = options.returnSingleItem ?? false;
 
-		// Extract the calendar date directly from the input string so that
-		// timezone offsets (e.g. +02:00) don't shift the date via UTC conversion.
-		const cutoffDate = startDate.slice(0, 10);
+		// Normalise to a full UTC ISO string so the comparison is precise
+		// down to the second, not just the calendar date.
+		const cutoff = new Date(startDate).toISOString();
 
 		const platforms: { param: string; platform: Platform }[] = [
 			{ param: 'arbeitsamtActorId', platform: 'arbeitsamt' },
@@ -381,7 +381,7 @@ export class ApifyDataset implements INodeType {
 			const mapper = MAPPERS[platform];
 
 			// Collect runs whose start date >= cutoff (any status)
-			const runs = await collectRuns(this, actorId, cutoffDate);
+			const runs = await collectRuns(this, actorId, cutoff);
 
 			// Fetch + map dataset items for each run
 			for (const run of runs) {
@@ -464,7 +464,7 @@ export class ApifyDataset implements INodeType {
 async function collectRuns(
 	ctx: IExecuteFunctions,
 	actorId: string,
-	cutoffDate: string,
+	cutoff: string,
 ): Promise<ApifyRun[]> {
 	const matching: ApifyRun[] = [];
 	let offset = 0;
@@ -487,8 +487,7 @@ async function collectRuns(
 		let anyMatchOnPage = false;
 		for (const run of runs) {
 			if (!run.defaultDatasetId) continue;
-			const runDate = run.startedAt.slice(0, 10);
-			if (runDate >= cutoffDate) {
+			if (run.startedAt >= cutoff) {
 				matching.push(run);
 				anyMatchOnPage = true;
 			}
