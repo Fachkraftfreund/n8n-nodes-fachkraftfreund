@@ -359,8 +359,9 @@ export class ApifyDataset implements INodeType {
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
 		const returnSingleItem = options.returnSingleItem ?? false;
 
-		// Use calendar-date comparison (YYYY-MM-DD) to avoid timezone edge cases
-		const cutoffDate = new Date(startDate).toISOString().slice(0, 10);
+		// Extract the calendar date directly from the input string so that
+		// timezone offsets (e.g. +02:00) don't shift the date via UTC conversion.
+		const cutoffDate = startDate.slice(0, 10);
 
 		const platforms: { param: string; platform: Platform }[] = [
 			{ param: 'arbeitsamtActorId', platform: 'arbeitsamt' },
@@ -467,9 +468,8 @@ async function collectRuns(
 ): Promise<ApifyRun[]> {
 	const matching: ApifyRun[] = [];
 	let offset = 0;
-	let done = false;
 
-	while (!done) {
+	while (true) {
 		const res = (await ctx.helpers.httpRequestWithAuthentication.call(
 			ctx,
 			'fachkraftfreundApifyApi',
@@ -484,21 +484,21 @@ async function collectRuns(
 		const runs = res?.data?.items ?? [];
 		if (runs.length === 0) break;
 
+		let anyMatchOnPage = false;
 		for (const run of runs) {
-			// Compare calendar dates only (YYYY-MM-DD)
-			const runDate = run.startedAt.slice(0, 10);
-
-			if (runDate < cutoffDate) {
-				done = true;
-				break;
-			}
-
 			if (!run.defaultDatasetId) continue;
-			matching.push(run);
+			const runDate = run.startedAt.slice(0, 10);
+			if (runDate >= cutoffDate) {
+				matching.push(run);
+				anyMatchOnPage = true;
+			}
 		}
 
 		offset += runs.length;
 		if (offset >= (res?.data?.total ?? 0)) break;
+		// If no run on this entire page matched, all remaining (older)
+		// runs are almost certainly before the cutoff — stop paginating.
+		if (!anyMatchOnPage) break;
 	}
 
 	return matching;
