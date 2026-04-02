@@ -266,7 +266,7 @@ export class ImpressumScraper implements INodeType {
 		const jobs: ScrapeJob[] = [];
 		for (let i = chunkStart; i < chunkEnd; i++) {
 			const companyName = this.getNodeParameter('companyName', i) as string;
-			const city = this.getNodeParameter('city', i) as string;
+			const city = (this.getNodeParameter('city', i, '') as string) || '';
 			jobs.push({ itemIndex: i, companyName, city, inputUrl: '', normalizedUrl: '' });
 		}
 
