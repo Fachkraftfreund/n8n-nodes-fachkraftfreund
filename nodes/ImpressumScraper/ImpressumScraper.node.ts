@@ -2215,6 +2215,15 @@ function extractCompanyName(businessText: string): string | null {
 		/^§\s*\d/,
 		/^(?:Auftraggeber|Erreichbarkeit)/i,
 		/^(?:Startseite|Skip|Zum\s+Inhalt|Navigation\s+überspringen)/i,
+		/^(?:Cookie|Akzeptieren|Einstellungen|Zustimmen|Ablehnen|Einverstanden|Datenschutzerklärung)/i,
+		/^(?:Suche|Suchen|Anmelden|Login|Registrieren|Abmelden|Warenkorb)/i,
+		/^(?:Öffnungszeiten|Sprechzeiten|Sprechstunden|Termine(?:\.?\s|$)|Online.?Termin)/i,
+		/^(?:Über\s+uns|Unser\s+Team|Unsere\s+Praxis|Leistungen|Service(?:s)?(?:\s|$))/i,
+		/^(?:Willkommen|Herzlich|Schön|Wir\s+freuen|Wir\s+begrüßen|Wir\s+bieten)/i,
+		/^(?:Mo|Di|Mi|Do|Fr|Sa|So)[\s.,-]/,
+		/^(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)/i,
+		/^(?:Alle\s+Rechte|All\s+rights|Copyright\b)/i,
+		/^(?:Zurück|Weiter|Seite\s+\d|Mehr\s+erfahren|Weiterlesen|Jetzt\s+)/i,
 	];
 
 	let startLine = 0;
@@ -2225,9 +2234,26 @@ function extractCompanyName(businessText: string): string | null {
 		}
 	}
 
+	// Pre-scan: check for explicit company name labels (e.g. "Firma: X" or "Firmenname: X")
+	const labelPattern = /^(?:Firma|Firmenname|Unternehmen|Betrieb|Name)\s*:\s*/i;
+	for (let i = startLine; i < Math.min(startLine + 10, lines.length); i++) {
+		const labelMatch = lines[i].match(labelPattern);
+		if (!labelMatch) continue;
+		const afterLabel = lines[i].substring(labelMatch[0].length).trim();
+		// Inline value: "Firmenname: Schlosserei Weidenbach e.K."
+		if (afterLabel.length >= 3) return afterLabel;
+		// Label on its own line: next line is the company name
+		if (i + 1 < lines.length && lines[i + 1].length >= 3 && lines[i + 1].length <= 150) {
+			return lines[i + 1];
+		}
+	}
+
+	// Collect and score candidates instead of returning the first match
+	const candidates: Array<{ line: string; score: number }> = [];
+
 	for (let i = startLine; i < Math.min(startLine + 8, lines.length); i++) {
 		const line = lines[i];
-		if (line.length < 3 || line.length > 150) continue;
+		if (line.length < 5 || line.length > 150) continue;
 
 		let skip = false;
 		for (const p of skipPatterns) {
@@ -2238,12 +2264,45 @@ function extractCompanyName(businessText: string): string | null {
 		}
 		if (skip) continue;
 
-		if (/[a-zäöüß]/i.test(line) && line.length >= 5) {
-			return line;
+		if (!/[a-zäöüß]/i.test(line)) continue;
+
+		let score = 1;
+
+		// Strong positive: legal form suffix — almost certainly a company name
+		if (/(?:GmbH|GbR|e\.?\s?K\.?|OHG|KG|UG|PartG|Part\s?mbB|Partnerschaft|mbH|AG|e\.?\s?V\.?|Ltd\.?|Co\.)(?:\s|$)/i.test(line)) {
+			score += 50;
 		}
+
+		// Strong positive: medical/dental practice keywords
+		if (/(?:praxis|MVZ|Medizinisch|Zahnmedizin|Zahnarzt|Gemeinschaftspraxis|Praxisgemeinschaft|Zahnheilkunde|Kieferorthopäd|Zahntechni|Implantolog|Klinik\b|Zentrum\b)/i.test(line)) {
+			score += 40;
+		}
+
+		// Medium positive: "Dr." in compound names (e.g. "Dr. Müller & Dr. Schmidt")
+		if (/Dr\./i.test(line) && /&|und|,/.test(line)) {
+			score += 20;
+		}
+
+		// Slight positive: earlier lines are more likely the company name (tiebreaker)
+		score += Math.max(0, 5 - (i - startLine));
+
+		// Negative: looks like a sentence (common verbs / pronouns)
+		if (/\b(?:ist|sind|wird|werden|haben|hat|können|kann|sollen|wir|Sie|bitte|unsere[mnrs]?|diese[mnrs]?)\b/i.test(line)) {
+			score -= 20;
+		}
+
+		// Negative: looks like a street address (contains house number pattern)
+		if (/(?:str\.|straße|weg|allee|platz|gasse|ring|damm)\s+\d/i.test(line) || /\d+\s*[a-c]?\s*$/i.test(line)) {
+			score -= 15;
+		}
+
+		candidates.push({ line, score });
 	}
 
-	return null;
+	if (candidates.length === 0) return null;
+
+	candidates.sort((a, b) => b.score - a.score);
+	return candidates[0].line;
 }
 
 interface PersonInfo {
