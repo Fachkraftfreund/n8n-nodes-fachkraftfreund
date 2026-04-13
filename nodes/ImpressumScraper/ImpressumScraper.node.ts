@@ -1356,6 +1356,15 @@ const OPENAI_CONCURRENCY = 15;
 
 const ARRAY_FIELDS = new Set(['emails', 'phones', 'faxNumbers', 'mobileNumbers']);
 
+/** Returns true when the value looks like a valid DACH postal code (4-5 digits, sane range). */
+function isValidPostalCode(value: string | null | undefined): boolean {
+	if (!value) return false;
+	const stripped = String(value).replace(/\s/g, '');
+	if (!/^\d{4,5}$/.test(stripped)) return false;
+	const num = parseInt(stripped, 10);
+	return num >= 1000 && num <= 99999;
+}
+
 /**
  * Checks if regex-extracted data looks plausible.
  * Returns false (= implausible, needs full OpenAI re-parse) when:
@@ -1451,6 +1460,7 @@ async function enrichWithOpenAi(
 				// Override ALL fields from OpenAI (full re-parse)
 				for (const field of allFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
+						if (field === 'postalCode' && !isValidPostalCode(String(extracted[field]))) continue;
 						if (ARRAY_FIELDS.has(field)) {
 							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
@@ -1488,6 +1498,7 @@ async function enrichWithOpenAi(
 				// Only fill empty fields — never override regex results
 				for (const field of missingFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
+						if (field === 'postalCode' && !isValidPostalCode(String(extracted[field]))) continue;
 						if (ARRAY_FIELDS.has(field) && (data[field] as unknown[]).length === 0) {
 							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
