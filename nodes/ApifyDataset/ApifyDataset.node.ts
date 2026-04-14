@@ -201,6 +201,11 @@ interface ApifyListResponse<T> {
 	data: { total: number; offset: number; limit: number; items: T[] };
 }
 
+interface TaggedRun {
+	run: ApifyRun;
+	platform: Platform;
+}
+
 // ─── Load-options: discover actors from run history ──────────────────────────
 
 async function getActors(
@@ -343,6 +348,33 @@ export class ApifyDataset implements INodeType {
 						description:
 							'Whether to return all companies in a single item instead of one item per company',
 					},
+					{
+						displayName: 'Runs Per Batch',
+						name: 'runsPerBatch',
+						type: 'number',
+						default: 0,
+						description:
+							'Process this many runs at a time before checking the company limit. 0 = process all runs at once.',
+						typeOptions: { minValue: 0 },
+					},
+					{
+						displayName: 'Company Limit',
+						name: 'companyLimit',
+						type: 'number',
+						default: 0,
+						description:
+							'Stop after collecting this many unique companies. 0 = no limit (collect all).',
+						typeOptions: { minValue: 0 },
+					},
+					{
+						displayName: 'Max Runs',
+						name: 'maxRuns',
+						type: 'number',
+						default: 0,
+						description:
+							'Maximum total runs to process across all platforms. 0 = no limit.',
+						typeOptions: { minValue: 0 },
+					},
 				],
 			},
 		],
@@ -355,9 +387,15 @@ export class ApifyDataset implements INodeType {
 		const options = this.getNodeParameter('options', 0, {}) as {
 			pageSize?: number;
 			returnSingleItem?: boolean;
+			runsPerBatch?: number;
+			companyLimit?: number;
+			maxRuns?: number;
 		};
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
 		const returnSingleItem = options.returnSingleItem ?? false;
+		const runsPerBatch = options.runsPerBatch ?? 0;
+		const companyLimit = options.companyLimit ?? 0;
+		const maxRuns = options.maxRuns ?? 0;
 
 		// Normalise to a full UTC ISO string so the comparison is precise
 		// down to the second, not just the calendar date.
@@ -369,22 +407,33 @@ export class ApifyDataset implements INodeType {
 			{ param: 'stepstoneActorId', platform: 'stepstone' },
 		];
 
-		// Collect all mapped jobs, grouped by normalized company name
-		const jobsByCompany = new Map<string, IDataObject[]>();
-		// Cache filtered company keys to skip them in O(1) on subsequent jobs
-		const filteredKeys = new Set<string>();
-
+		// Phase 1: Collect run metadata for all platforms (lightweight)
+		const allRuns: TaggedRun[] = [];
 		for (const { param, platform } of platforms) {
 			const actorId = this.getNodeParameter(param, 0) as string;
 			if (!actorId) continue;
-
-			const mapper = MAPPERS[platform];
-
-			// Collect runs whose start date >= cutoff (any status)
 			const runs = await collectRuns(this, actorId, cutoff);
-
-			// Fetch + map dataset items for each run
 			for (const run of runs) {
+				allRuns.push({ run, platform });
+			}
+		}
+
+		// Sort by startedAt descending so freshest runs are processed first
+		allRuns.sort((a, b) => b.run.startedAt.localeCompare(a.run.startedAt));
+
+		// Apply maxRuns cap
+		const runsToProcess = maxRuns > 0 ? allRuns.slice(0, maxRuns) : allRuns;
+
+		// Phase 2: Process runs in batches
+		const jobsByCompany = new Map<string, IDataObject[]>();
+		const filteredKeys = new Set<string>();
+		const batchSize = runsPerBatch > 0 ? runsPerBatch : runsToProcess.length;
+
+		for (let batchStart = 0; batchStart < runsToProcess.length; batchStart += batchSize) {
+			const batch = runsToProcess.slice(batchStart, batchStart + batchSize);
+
+			for (const { run, platform } of batch) {
+				const mapper = MAPPERS[platform];
 				const dsUrl = `${API_BASE}/datasets/${run.defaultDatasetId}/items`;
 				let offset = 0;
 
@@ -432,9 +481,14 @@ export class ApifyDataset implements INodeType {
 					if (items.length < pageSize) break;
 				}
 			}
+
+			// Check company limit after each batch
+			if (companyLimit > 0 && jobsByCompany.size >= companyLimit) {
+				break;
+			}
 		}
 
-		// Build output: one item per company, or all companies in a single item
+		// Phase 3: Build output — one item per company, or all in a single item
 		const companies: IDataObject[] = [];
 		for (const [normalizedName, jobs] of jobsByCompany) {
 			const first = jobs[0];
