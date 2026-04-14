@@ -374,9 +374,27 @@ export class ImpressumScraper implements INodeType {
 				continue;
 			}
 
-			// Items with >1 result need OpenAI to pick the homepage
-			if (openAiKey && gr.filtered.length > 1) {
-				aiPickJobs.push({ job, query, filtered: gr.filtered });
+			// Items with >1 result: try heuristic first, fall back to OpenAI
+			if (gr.filtered.length > 1) {
+				const heuristicPick = pickHomepageByDomain(gr.filtered, job.companyName, job.city);
+				if (heuristicPick) {
+					const homepageUrl = heuristicPick;
+					job.inputUrl = homepageUrl;
+					let normalizedUrl = homepageUrl.trim();
+					if (!/^https?:\/\//i.test(normalizedUrl)) normalizedUrl = 'https://' + normalizedUrl;
+					try { new URL(normalizedUrl); job.normalizedUrl = normalizedUrl; }
+					catch { job.error = `Invalid URL resolved from search: ${homepageUrl}`; }
+				} else if (openAiKey) {
+					aiPickJobs.push({ job, query, filtered: gr.filtered });
+				} else {
+					// No OpenAI key and heuristic failed — use first result
+					const homepageUrl = gr.filtered[0].link;
+					job.inputUrl = homepageUrl;
+					let normalizedUrl = homepageUrl.trim();
+					if (!/^https?:\/\//i.test(normalizedUrl)) normalizedUrl = 'https://' + normalizedUrl;
+					try { new URL(normalizedUrl); job.normalizedUrl = normalizedUrl; }
+					catch { job.error = `Invalid URL resolved from search: ${homepageUrl}`; }
+				}
 			} else if (gr.filtered.length > 0) {
 				// Only one result — use it directly
 				const homepageUrl = gr.filtered[0].link;
@@ -457,8 +475,8 @@ export class ImpressumScraper implements INodeType {
 			}
 		}
 
-		// ── Phase 0c: Domain guessing fallback (OpenAI) ─────────────
-		if (openAiKey) {
+		// ── Phase 0c: Domain guessing fallback (deterministic + AI) ──
+		{
 			const jobsStillNeedingHomepage = jobs.filter(
 				(j) => !j.normalizedUrl && !j.error,
 			);
@@ -469,34 +487,49 @@ export class ImpressumScraper implements INodeType {
 			const allGuessJobs = [...jobsStillNeedingHomepage, ...jobsFromDirFailure];
 
 			if (allGuessJobs.length > 0) {
-				for (let i = 0; i < allGuessJobs.length; i += OPENAI_CONCURRENCY) {
-					const batch = allGuessJobs.slice(i, i + OPENAI_CONCURRENCY);
-					const settled = await Promise.allSettled(
-						batch.map(async (job) => {
-							const guesses = await guessDomains(this, job.companyName, job.city, openAiKey, openAiModel);
-							if (guesses.length === 0) return;
-
-							// Verify which domains exist (parallel HEAD requests)
-							const checks = await Promise.allSettled(
-								guesses.slice(0, 8).map(async (domain) => {
-									const exists = await domainExists(this, domain, timeout);
-									return { domain, exists };
-								}),
-							);
-
-							for (const check of checks) {
-								if (check.status === 'fulfilled' && check.value.exists) {
-									const url = `https://${check.value.domain}`;
-									job.inputUrl = url;
-									job.normalizedUrl = url;
-									job.error = undefined;
-									return;
-								}
-							}
+				// Step 1: Try deterministic guesses (no AI needed)
+				const verifyAndAssign = async (job: ScrapeJob, guesses: string[]): Promise<boolean> => {
+					if (guesses.length === 0) return false;
+					const checks = await Promise.allSettled(
+						guesses.slice(0, 8).map(async (domain: string) => {
+							const exists = await domainExists(this, domain, timeout);
+							return { domain, exists };
 						}),
 					);
-					// Errors are silently ignored — domain guessing is best-effort
-					void settled;
+					for (const check of checks) {
+						if (check.status === 'fulfilled' && check.value.exists) {
+							const url = `https://${check.value.domain}`;
+							job.inputUrl = url;
+							job.normalizedUrl = url;
+							job.error = undefined;
+							return true;
+						}
+					}
+					return false;
+				};
+
+				for (let i = 0; i < allGuessJobs.length; i += OPENAI_CONCURRENCY) {
+					const batch = allGuessJobs.slice(i, i + OPENAI_CONCURRENCY);
+					await Promise.allSettled(
+						batch.map(async (job) => {
+							const localGuesses = guessDomainsLocal(job.companyName, job.city);
+							await verifyAndAssign(job, localGuesses);
+						}),
+					);
+				}
+
+				// Step 2: AI fallback for jobs where deterministic guesses failed
+				if (openAiKey) {
+					const aiGuessJobs = allGuessJobs.filter((j) => !j.normalizedUrl || j.error);
+					for (let i = 0; i < aiGuessJobs.length; i += OPENAI_CONCURRENCY) {
+						const batch = aiGuessJobs.slice(i, i + OPENAI_CONCURRENCY);
+						await Promise.allSettled(
+							batch.map(async (job) => {
+								const aiGuesses = await guessDomainsAi(this, job.companyName, job.city, openAiKey!, openAiModel);
+								await verifyAndAssign(job, aiGuesses);
+							}),
+						);
+					}
 				}
 			}
 		}
@@ -1225,6 +1258,40 @@ async function searchWeb(
 }
 
 /**
+ * Heuristic homepage picker: scores each result's domain against company name keywords.
+ * Returns the URL of the best match if one result clearly stands out, or null if ambiguous.
+ */
+function pickHomepageByDomain(results: SearchResult[], companyName: string, city: string): string | null {
+	const UMLAUT_MAP: Record<string, string> = { 'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss' };
+	const normalize = (s: string) =>
+		s.toLowerCase().replace(/[äöüß]/g, (c) => UMLAUT_MAP[c] || c).replace(/[^a-z0-9\s]/g, '');
+
+	const SKIP = /^(zahnarzt|praxis|zahnarztpraxis|kieferorthopaedie|kiefer|orthopaede|arzt|arztpraxis|klinik|zentrum|institut|gmbh|gbr|ohg|ug|dr|prof|med|dent|dipl|und|am|im|an|der|die|das|den|dem|fuer|von|zu|zur|zum)$/;
+
+	const keywords = [...normalize(companyName).split(/\s+/), ...(city ? normalize(city).split(/\s+/) : [])]
+		.filter((w) => w.length >= 3 && !SKIP.test(w));
+
+	if (keywords.length === 0) return null;
+
+	const scored: Array<{ link: string; score: number }> = [];
+	for (const r of results) {
+		try {
+			const hostname = new URL(r.link).hostname.toLowerCase();
+			const matchCount = keywords.filter((kw) => hostname.includes(kw)).length;
+			scored.push({ link: r.link, score: matchCount });
+		} catch { scored.push({ link: r.link, score: 0 }); }
+	}
+
+	scored.sort((a, b) => b.score - a.score);
+
+	// Only pick if the top result has matches AND clearly beats the runner-up
+	if (scored[0].score >= 1 && scored[0].score > (scored[1]?.score ?? 0)) {
+		return scored[0].link;
+	}
+	return null;
+}
+
+/**
  * Heuristic: do any of the filtered results look like they belong to the company's
  * own website? Extracts keywords from the company name/city and checks if any
  * result's domain contains them. If not, we should try another search engine.
@@ -1328,9 +1395,10 @@ async function findHomepageWithOpenAi(
 // Plausibility Check + OpenAI Enrichment
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Note: salutation is intentionally excluded — Phase 7 (deriveSalutations) handles it
+// more efficiently via a lookup table + batched AI fallback.
 const EXTRACTABLE_FIELDS: Record<string, string> = {
 	companyName: 'Company or practice name (Firmenname / Praxisname)',
-	salutation: 'Salutation: "Herr" or "Frau" only',
 	title: 'Academic/professional title (e.g. Dr., Prof., Dr. med., Dr. med. dent.)',
 	firstName: 'First name (Vorname)',
 	lastName: 'Last name (Nachname)',
@@ -1869,12 +1937,61 @@ interface ImpressumResult {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Salutation Derivation from First Name
+// Salutation Derivation from First Name (lookup table + AI fallback)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Common German first names → salutation. Covers the vast majority of cases.
+const MALE_NAMES = new Set([
+	'alexander', 'andreas', 'anton', 'axel', 'benjamin', 'bernd', 'bernhard',
+	'björn', 'boris', 'carsten', 'christian', 'christoph', 'claus', 'clemens',
+	'daniel', 'david', 'dennis', 'detlef', 'dieter', 'dietmar', 'dirk',
+	'dominik', 'eckhard', 'edgar', 'eric', 'erik', 'ernst', 'fabian',
+	'felix', 'florian', 'frank', 'franz', 'frederic', 'friedrich', 'georg',
+	'gerald', 'gerd', 'gerhard', 'gregor', 'günter', 'günther', 'guido',
+	'hans', 'harald', 'heiko', 'heinz', 'helmut', 'hendrik', 'henning',
+	'herbert', 'hermann', 'holger', 'horst', 'ingo', 'jan', 'jens', 'joachim',
+	'jochen', 'joerg', 'johann', 'johannes', 'jonas', 'jörg', 'josef',
+	'jürgen', 'kai', 'karl', 'karsten', 'klaus', 'konrad', 'lars',
+	'lorenz', 'lothar', 'lukas', 'lutz', 'manfred', 'marc', 'marcel',
+	'marco', 'marcus', 'mario', 'markus', 'martin', 'mathias', 'matthias',
+	'max', 'maximilian', 'michael', 'moritz', 'nico', 'niklas', 'nils',
+	'norbert', 'olaf', 'oliver', 'otto', 'pascal', 'patrick', 'paul',
+	'peter', 'philipp', 'rainer', 'ralf', 'ralph', 'reinhard', 'robert',
+	'robin', 'roland', 'rolf', 'roman', 'rüdiger', 'sascha', 'sebastian',
+	'simon', 'stefan', 'steffen', 'stephan', 'sven', 'thomas', 'thorsten',
+	'tim', 'tobias', 'torsten', 'uwe', 'volker', 'walter', 'werner',
+	'wilhelm', 'willi', 'wolfgang',
+]);
+
+const FEMALE_NAMES = new Set([
+	'alexandra', 'andrea', 'anja', 'anna', 'annett', 'annette', 'antje',
+	'astrid', 'barbara', 'beate', 'bianca', 'birgit', 'britta', 'carla',
+	'carmen', 'caroline', 'charlotte', 'christa', 'christiane', 'christina',
+	'claudia', 'constanze', 'cordula', 'cornelia', 'dagmar', 'daniela',
+	'diana', 'doris', 'dorothea', 'edith', 'elke', 'ellen', 'emma',
+	'eva', 'franziska', 'gabriele', 'gisela', 'gudrun', 'hannelore',
+	'heide', 'heike', 'helga', 'ina', 'ines', 'ingrid', 'irene', 'iris',
+	'jana', 'janina', 'jasmin', 'jennifer', 'jessica', 'julia', 'juliane',
+	'karen', 'karin', 'karola', 'katharina', 'kathrin', 'katja', 'katrin',
+	'kerstin', 'klara', 'lara', 'laura', 'lea', 'lena', 'lisa', 'luise',
+	'manuela', 'margarete', 'maria', 'marie', 'marina', 'marion', 'marlene',
+	'martina', 'meike', 'melanie', 'michaela', 'monika', 'nadine', 'nadja',
+	'nicole', 'nina', 'patricia', 'petra', 'pia', 'regina', 'renate',
+	'ruth', 'sabina', 'sabine', 'sandra', 'sara', 'sarah', 'silke',
+	'simone', 'sonja', 'sophia', 'sophie', 'stefanie', 'stephanie',
+	'susanne', 'svenja', 'tanja', 'tatjana', 'ulrike', 'ursula', 'ute',
+	'vanessa', 'vera', 'verena', 'veronika',
+]);
+
+function lookupSalutation(firstName: string): 'Herr' | 'Frau' | null {
+	const lower = firstName.toLowerCase().trim();
+	if (MALE_NAMES.has(lower)) return 'Herr';
+	if (FEMALE_NAMES.has(lower)) return 'Frau';
+	return null;
+}
+
 /**
- * Batches all firstNames missing a salutation into a single OpenAI call.
- * Returns "Herr" or "Frau" for each name.
+ * Derives salutations from firstNames: lookup table first, AI fallback for unknowns.
  */
 async function deriveSalutations(
 	ctx: IExecuteFunctions,
@@ -1882,18 +1999,23 @@ async function deriveSalutations(
 	openAiKey: string,
 	model: string,
 ): Promise<void> {
-	const needsSalutation: Array<{ idx: number; firstName: string }> = [];
+	const needsAi: Array<{ idx: number; firstName: string }> = [];
 
 	for (let i = 0; i < results.length; i++) {
 		const { data } = results[i];
 		if (!data.salutation && data.firstName) {
-			needsSalutation.push({ idx: i, firstName: data.firstName });
+			const lookup = lookupSalutation(data.firstName);
+			if (lookup) {
+				data.salutation = lookup;
+			} else {
+				needsAi.push({ idx: i, firstName: data.firstName });
+			}
 		}
 	}
 
-	if (needsSalutation.length === 0) return;
+	if (needsAi.length === 0) return;
 
-	const nameList = needsSalutation.map((n) => n.firstName).join(', ');
+	const nameList = needsAi.map((n) => n.firstName).join(', ');
 
 	try {
 		const response = await ctx.helpers.httpRequest({
@@ -1927,7 +2049,7 @@ async function deriveSalutations(
 
 		const mapping: Record<string, string> = JSON.parse(content);
 
-		for (const { idx, firstName } of needsSalutation) {
+		for (const { idx, firstName } of needsAi) {
 			const val = mapping[firstName];
 			if (val === 'Herr' || val === 'Frau') {
 				results[idx].data.salutation = val;
@@ -1939,12 +2061,58 @@ async function deriveSalutations(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phone Number Normalization via OpenAI
+// Phone Number Normalization (regex + AI fallback)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Sends all raw phone/fax/mobile strings to OpenAI for normalization.
- * Handles weird formats like "(0124) 23123 43 / 44" → two separate numbers.
+ * Tries to normalize a single phone number string with regex.
+ * Returns an array of normalized numbers, or null if the format is too complex
+ * (compound numbers with "/" that need AI interpretation).
+ */
+function normalizePhoneLocal(raw: string): string[] | null {
+	const trimmed = raw.trim();
+
+	// Detect compound numbers like "0123 456 / 789" — needs AI to split correctly
+	if (/\d\s*[/]\s*\d/.test(trimmed)) return null;
+
+	// Strip parentheses, normalize whitespace/dashes to single space
+	let cleaned = trimmed
+		.replace(/[()]/g, '')
+		.replace(/[-–—.]+/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+
+	// Already in international format (+49 ...)? Just clean up spacing
+	if (/^\+\d/.test(cleaned)) {
+		// Collapse to digits after the +, then format as "+XX XXXX XXXXXXX"
+		const digits = cleaned.replace(/[^\d+]/g, '');
+		if (digits.replace(/\D/g, '').length >= 6) return [digits];
+		return null;
+	}
+
+	// Starts with 00XX (international dialing)? Convert to +XX
+	if (/^00\d/.test(cleaned)) {
+		cleaned = '+' + cleaned.slice(2).replace(/\s/g, '');
+		if (cleaned.replace(/\D/g, '').length >= 6) return [cleaned];
+		return null;
+	}
+
+	// Standard German number: starts with 0, has enough digits
+	const digits = cleaned.replace(/\D/g, '');
+	if (/^0\d/.test(digits) && digits.length >= 6 && digits.length <= 15) {
+		// Format as "0XXXX XXXXXXX" — split area code (2-5 digits after 0) from subscriber
+		// Simple approach: keep the cleaned version with normalized spacing
+		const formatted = cleaned.replace(/\s{2,}/g, ' ');
+		return [formatted];
+	}
+
+	// Doesn't look like a standard number — let AI handle it
+	if (digits.length < 6) return null;
+	return [cleaned];
+}
+
+/**
+ * Normalizes phone numbers: regex for simple formats, AI fallback for complex ones.
  */
 async function normalizePhoneNumbers(
 	ctx: IExecuteFunctions,
@@ -1952,75 +2120,93 @@ async function normalizePhoneNumbers(
 	openAiKey: string,
 	model: string,
 ): Promise<void> {
-	const rawNumbers: Array<{ resultIdx: number; field: 'phones' | 'faxNumbers' | 'mobileNumbers'; raw: string }> = [];
+	type PhoneEntry = { resultIdx: number; field: 'phones' | 'faxNumbers' | 'mobileNumbers'; raw: string };
+	const allEntries: PhoneEntry[] = [];
+	const needsAi: Array<{ entryIdx: number } & PhoneEntry> = [];
 
 	for (let i = 0; i < results.length; i++) {
 		const { data } = results[i];
-		for (const num of data.phones) rawNumbers.push({ resultIdx: i, field: 'phones', raw: num });
-		for (const num of data.faxNumbers) rawNumbers.push({ resultIdx: i, field: 'faxNumbers', raw: num });
-		for (const num of data.mobileNumbers) rawNumbers.push({ resultIdx: i, field: 'mobileNumbers', raw: num });
+		for (const num of data.phones) allEntries.push({ resultIdx: i, field: 'phones', raw: num });
+		for (const num of data.faxNumbers) allEntries.push({ resultIdx: i, field: 'faxNumbers', raw: num });
+		for (const num of data.mobileNumbers) allEntries.push({ resultIdx: i, field: 'mobileNumbers', raw: num });
 	}
 
-	if (rawNumbers.length === 0) return;
+	if (allEntries.length === 0) return;
 
-	const numberList = rawNumbers.map((n, i) => `${i}: ${n.raw}`).join('\n');
+	// Step 1: Try regex normalization for each number
+	const resolved: Array<string[] | null> = allEntries.map((e) => normalizePhoneLocal(e.raw));
 
-	try {
-		const response = await ctx.helpers.httpRequest({
-			method: 'POST',
-			url: 'https://api.openai.com/v1/chat/completions',
-			headers: {
-				Authorization: `Bearer ${openAiKey}`,
-				'Content-Type': 'application/json',
-			},
-			body: {
-				model,
-				temperature: 0,
-				response_format: { type: 'json_object' },
-				messages: [
-					{
-						role: 'system',
-						content:
-							'You normalize German phone numbers. For each numbered entry:\n' +
-							'1. Split entries that contain multiple numbers (e.g. "23123 43 / 44" means two numbers sharing a prefix: the base number ending in 43 and another ending in 44).\n' +
-							'2. Format each as a clean, readable German phone number (e.g. "0124 2312343").\n' +
-							'3. Return a JSON object where each key is the entry index (as string) and the value is an array of normalized phone numbers.',
-					},
-					{
-						role: 'user',
-						content: numberList,
-					},
-				],
-			},
-			timeout: 15000,
-		});
-
-		const content = response?.choices?.[0]?.message?.content;
-		if (!content) return;
-
-		const mapping: Record<string, string[]> = JSON.parse(content);
-
-		// Clear and rebuild arrays per result
-		for (const result of results) {
-			result.data.phones = [];
-			result.data.faxNumbers = [];
-			result.data.mobileNumbers = [];
+	for (let i = 0; i < resolved.length; i++) {
+		if (resolved[i] === null) {
+			needsAi.push({ entryIdx: i, ...allEntries[i] });
 		}
+	}
 
-		for (let i = 0; i < rawNumbers.length; i++) {
-			const { resultIdx, field } = rawNumbers[i];
-			const normalized = mapping[String(i)];
-			if (Array.isArray(normalized)) {
-				results[resultIdx].data[field].push(
-					...normalized.filter((n) => typeof n === 'string' && n.length > 0),
-				);
-			} else {
-				// Fallback: keep original
-				results[resultIdx].data[field].push(rawNumbers[i].raw);
+	// Step 2: AI fallback only for numbers that regex couldn't handle
+	if (needsAi.length > 0) {
+		const numberList = needsAi.map((n, i) => `${i}: ${n.raw}`).join('\n');
+
+		try {
+			const response = await ctx.helpers.httpRequest({
+				method: 'POST',
+				url: 'https://api.openai.com/v1/chat/completions',
+				headers: {
+					Authorization: `Bearer ${openAiKey}`,
+					'Content-Type': 'application/json',
+				},
+				body: {
+					model,
+					temperature: 0,
+					response_format: { type: 'json_object' },
+					messages: [
+						{
+							role: 'system',
+							content:
+								'You normalize German phone numbers. For each numbered entry:\n' +
+								'1. Split entries that contain multiple numbers (e.g. "23123 43 / 44" means two numbers sharing a prefix: the base number ending in 43 and another ending in 44).\n' +
+								'2. Format each as a clean, readable German phone number (e.g. "0124 2312343").\n' +
+								'3. Return a JSON object where each key is the entry index (as string) and the value is an array of normalized phone numbers.',
+						},
+						{
+							role: 'user',
+							content: numberList,
+						},
+					],
+				},
+				timeout: 15000,
+			});
+
+			const content = response?.choices?.[0]?.message?.content;
+			if (content) {
+				const mapping: Record<string, string[]> = JSON.parse(content);
+				for (let i = 0; i < needsAi.length; i++) {
+					const aiResult = mapping[String(i)];
+					if (Array.isArray(aiResult)) {
+						resolved[needsAi[i].entryIdx] = aiResult.filter((n) => typeof n === 'string' && n.length > 0);
+					}
+				}
 			}
+		} catch {
+			// AI normalization is best-effort
 		}
-	} catch {
-		// Phone normalization is best-effort
+	}
+
+	// Step 3: Rebuild arrays from resolved values
+	for (const result of results) {
+		result.data.phones = [];
+		result.data.faxNumbers = [];
+		result.data.mobileNumbers = [];
+	}
+
+	for (let i = 0; i < allEntries.length; i++) {
+		const { resultIdx, field, raw } = allEntries[i];
+		const nums = resolved[i];
+		if (nums && nums.length > 0) {
+			results[resultIdx].data[field].push(...nums);
+		} else {
+			// Keep original if nothing worked
+			results[resultIdx].data[field].push(raw);
+		}
 	}
 }
 
@@ -2867,14 +3053,74 @@ function extractManagingDirector(businessText: string): string | null {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Domain Guessing (OpenAI + verification)
+// Domain Guessing (deterministic + OpenAI fallback)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const DOMAIN_UMLAUT_MAP: Record<string, string> = { 'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'ß': 'ss' };
+
+function transliterate(s: string): string {
+	return s.toLowerCase().replace(/[äöüß]/g, (c) => DOMAIN_UMLAUT_MAP[c] || c);
+}
+
+function slugify(s: string): string {
+	return transliterate(s)
+		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/^-+|-+$/g, '');
+}
+
+const TITLE_RE = /^(dr\.?\s*(med\.?\s*(dent\.?)?)?|prof\.?\s*(dr\.?\s*(med\.?\s*(dent\.?)?)?)?|dipl\.\s*\w+\.?)\s*/i;
+const LEGAL_SUFFIX_RE = /\s+(gmbh|gbr|ohg|ug|ag|e\.?\s*k\.?|partg\s*mbb|mbh)\.?$/i;
+const PROFESSION_RE = /^(zahnarzt(?:praxis)?|praxis|kieferorthop(?:ae|[aä])d(?:ie|ische?\s+praxis)?|arzt(?:praxis)?|klinik|zentrum|institut)\s+/i;
+
 /**
- * Asks OpenAI to guess likely domain names for a German company.
- * Returns an array of domain guesses (e.g. ["zahnarzt-mueller.de", "praxis-mueller-berlin.de"]).
+ * Deterministically guesses likely domain names for a German company.
+ * Covers the common patterns without needing an AI call.
  */
-async function guessDomains(
+function guessDomainsLocal(companyName: string, city: string): string[] {
+	const guesses = new Set<string>();
+	const cleaned = companyName.trim();
+
+	// Strip title for a "no-title" variant
+	const noTitle = cleaned.replace(TITLE_RE, '').trim();
+	// Strip legal suffix
+	const noSuffix = noTitle.replace(LEGAL_SUFFIX_RE, '').trim();
+
+	// Full slug (e.g. "zahnarztpraxis-dr-mueller" or "lange-und-rakhimov")
+	const fullSlug = slugify(noSuffix);
+	if (fullSlug.length >= 3) guesses.add(`${fullSlug}.de`);
+
+	// Without title (e.g. "zahnarztpraxis-mueller")
+	const noTitleSlug = slugify(noSuffix.replace(TITLE_RE, '').trim());
+	if (noTitleSlug.length >= 3 && noTitleSlug !== fullSlug) guesses.add(`${noTitleSlug}.de`);
+
+	// With city (e.g. "zahnarzt-mueller-dresden")
+	const citySlug = city ? slugify(city) : '';
+	if (citySlug && fullSlug.length >= 3) guesses.add(`${fullSlug}-${citySlug}.de`);
+	if (citySlug && noTitleSlug.length >= 3 && noTitleSlug !== fullSlug) guesses.add(`${noTitleSlug}-${citySlug}.de`);
+
+	// Extract last name from patterns like "Zahnarztpraxis Dr. Müller" or "Praxis Müller"
+	const profMatch = noSuffix.match(PROFESSION_RE);
+	if (profMatch) {
+		const rest = noSuffix.slice(profMatch[0].length).replace(TITLE_RE, '').trim();
+		const parts = rest.split(/\s+/);
+		const lastName = parts[parts.length - 1];
+		if (lastName && lastName.length >= 2) {
+			const lastSlug = slugify(lastName);
+			const profSlug = slugify(profMatch[1]);
+			guesses.add(`${profSlug}-${lastSlug}.de`);
+			guesses.add(`praxis-${lastSlug}.de`);
+			if (citySlug) guesses.add(`${profSlug}-${lastSlug}-${citySlug}.de`);
+		}
+	}
+
+	return [...guesses].slice(0, 8);
+}
+
+/**
+ * AI fallback: asks OpenAI to guess likely domain names for a German company.
+ * Only called when deterministic guesses all failed verification.
+ */
+async function guessDomainsAi(
 	ctx: IExecuteFunctions,
 	companyName: string,
 	city: string,
