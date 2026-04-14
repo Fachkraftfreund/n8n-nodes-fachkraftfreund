@@ -354,25 +354,16 @@ export class ApifyDataset implements INodeType {
 						type: 'number',
 						default: 0,
 						description:
-							'Process this many runs at a time before checking the company limit. 0 = process all runs at once.',
+							'Process this many runs at a time. 0 = process all runs at once.',
 						typeOptions: { minValue: 0 },
 					},
 					{
-						displayName: 'Company Limit',
-						name: 'companyLimit',
+						displayName: 'Min Companies',
+						name: 'minCompanies',
 						type: 'number',
 						default: 0,
 						description:
-							'Stop after collecting this many unique companies. 0 = no limit (collect all).',
-						typeOptions: { minValue: 0 },
-					},
-					{
-						displayName: 'Max Runs',
-						name: 'maxRuns',
-						type: 'number',
-						default: 0,
-						description:
-							'Maximum total runs to process across all platforms. 0 = no limit.',
+							'Keep processing additional batches until at least this many unique companies are collected, even if runsPerBatch would stop sooner. 0 = respect runsPerBatch only.',
 						typeOptions: { minValue: 0 },
 					},
 				],
@@ -388,14 +379,12 @@ export class ApifyDataset implements INodeType {
 			pageSize?: number;
 			returnSingleItem?: boolean;
 			runsPerBatch?: number;
-			companyLimit?: number;
-			maxRuns?: number;
+			minCompanies?: number;
 		};
 		const pageSize = options.pageSize ?? ITEMS_PAGE_SIZE;
 		const returnSingleItem = options.returnSingleItem ?? false;
 		const runsPerBatch = options.runsPerBatch ?? 0;
-		const companyLimit = options.companyLimit ?? 0;
-		const maxRuns = options.maxRuns ?? 0;
+		const minCompanies = options.minCompanies ?? 0;
 
 		// Normalise to a full UTC ISO string so the comparison is precise
 		// down to the second, not just the calendar date.
@@ -421,12 +410,10 @@ export class ApifyDataset implements INodeType {
 		// Sort by startedAt descending so freshest runs are processed first
 		allRuns.sort((a, b) => b.run.startedAt.localeCompare(a.run.startedAt));
 
-		// Apply maxRuns cap
-		const runsToProcess = maxRuns > 0 ? allRuns.slice(0, maxRuns) : allRuns;
-
 		// Phase 2: Process runs in batches
 		const jobsByCompany = new Map<string, IDataObject[]>();
 		const filteredKeys = new Set<string>();
+		const runsToProcess = allRuns;
 		const batchSize = runsPerBatch > 0 ? runsPerBatch : runsToProcess.length;
 
 		for (let batchStart = 0; batchStart < runsToProcess.length; batchStart += batchSize) {
@@ -482,9 +469,12 @@ export class ApifyDataset implements INodeType {
 				}
 			}
 
-			// Check company limit after each batch
-			if (companyLimit > 0 && jobsByCompany.size >= companyLimit) {
-				break;
+			// When batching is active, stop once the minCompanies threshold is
+			// met — or immediately after the first batch when no minimum is set.
+			if (runsPerBatch > 0) {
+				if (minCompanies <= 0 || jobsByCompany.size >= minCompanies) {
+					break;
+				}
 			}
 		}
 
