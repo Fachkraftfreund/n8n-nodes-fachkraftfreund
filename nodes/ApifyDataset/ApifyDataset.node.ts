@@ -297,7 +297,10 @@ export class ApifyDataset implements INodeType {
 			'Fetch and map dataset items from Arbeitsamt, Indeed and Stepstone actor runs',
 		defaults: { name: 'Apify Dataset' },
 		inputs: ['main'],
-		outputs: ['main'],
+		outputs: [
+			{ displayName: 'Loop Body', type: 'main' },
+			{ displayName: 'Done', type: 'main' },
+		],
 		credentials: [{ name: 'fachkraftfreundApifyApi', required: true }],
 		properties: [
 			actorProperty(
@@ -386,38 +389,55 @@ export class ApifyDataset implements INodeType {
 		const runsPerBatch = options.runsPerBatch ?? 0;
 		const minCompanies = options.minCompanies ?? 0;
 
-		// Normalise to a full UTC ISO string so the comparison is precise
-		// down to the second, not just the calendar date.
-		const cutoff = new Date(startDate).toISOString();
+		const context = this.getContext('node');
 
-		const platforms: { param: string; platform: Platform }[] = [
-			{ param: 'arbeitsamtActorId', platform: 'arbeitsamt' },
-			{ param: 'indeedActorId', platform: 'indeed' },
-			{ param: 'stepstoneActorId', platform: 'stepstone' },
-		];
+		// ── First iteration: collect run metadata ──────────────────────
+		if (context.initialized !== true) {
+			const cutoff = new Date(startDate).toISOString();
 
-		// Phase 1: Collect run metadata for all platforms (lightweight)
-		const allRuns: TaggedRun[] = [];
-		for (const { param, platform } of platforms) {
-			const actorId = this.getNodeParameter(param, 0) as string;
-			if (!actorId) continue;
-			const runs = await collectRuns(this, actorId, cutoff);
-			for (const run of runs) {
-				allRuns.push({ run, platform });
+			const platforms: { param: string; platform: Platform }[] = [
+				{ param: 'arbeitsamtActorId', platform: 'arbeitsamt' },
+				{ param: 'indeedActorId', platform: 'indeed' },
+				{ param: 'stepstoneActorId', platform: 'stepstone' },
+			];
+
+			const allRuns: TaggedRun[] = [];
+			for (const { param, platform } of platforms) {
+				const actorId = this.getNodeParameter(param, 0) as string;
+				if (!actorId) continue;
+				const runs = await collectRuns(this, actorId, cutoff);
+				for (const run of runs) {
+					allRuns.push({ run, platform });
+				}
 			}
+
+			// Sort by startedAt descending so freshest runs are processed first
+			allRuns.sort((a, b) => b.run.startedAt.localeCompare(a.run.startedAt));
+
+			context.initialized = true;
+			context.allRuns = allRuns;
+			context.batchIndex = 0;
+			context.seenKeys = [] as string[];
+			context.filteredKeys = [] as string[];
 		}
 
-		// Sort by startedAt descending so freshest runs are processed first
-		allRuns.sort((a, b) => b.run.startedAt.localeCompare(a.run.startedAt));
+		const allRuns = context.allRuns as TaggedRun[];
+		const seenKeys = new Set<string>(context.seenKeys as string[]);
+		const filteredKeys = new Set<string>(context.filteredKeys as string[]);
+		const batchSize = runsPerBatch > 0 ? runsPerBatch : allRuns.length;
+		let batchStart = (context.batchIndex as number) * batchSize;
 
-		// Phase 2: Process runs in batches
+		// ── No runs at all → output empty on Done ─────────────────────
+		if (allRuns.length === 0) {
+			return [[], [{ json: { done: true, totalCompanies: 0 } }]];
+		}
+
+		// ── Process batches until minCompanies is met or runs exhausted ─
 		const jobsByCompany = new Map<string, IDataObject[]>();
-		const filteredKeys = new Set<string>();
-		const runsToProcess = allRuns;
-		const batchSize = runsPerBatch > 0 ? runsPerBatch : runsToProcess.length;
 
-		for (let batchStart = 0; batchStart < runsToProcess.length; batchStart += batchSize) {
-			const batch = runsToProcess.slice(batchStart, batchStart + batchSize);
+		while (batchStart < allRuns.length) {
+			const batch = allRuns.slice(batchStart, batchStart + batchSize);
+			(context.batchIndex as number)++;
 
 			for (const { run, platform } of batch) {
 				const mapper = MAPPERS[platform];
@@ -447,15 +467,15 @@ export class ApifyDataset implements INodeType {
 
 						const key = normalize(name) ?? '';
 
-						// Skip companies that were already filtered out
 						if (filteredKeys.has(key)) continue;
+						if (seenKeys.has(key)) continue;
 
-						// Filter on first encounter, cache the result
-						if (!jobsByCompany.has(key) && isFilteredCompany(name)) {
+						if (isFilteredCompany(name)) {
 							filteredKeys.add(key);
 							continue;
 						}
 
+						seenKeys.add(key);
 						let group = jobsByCompany.get(key);
 						if (!group) {
 							group = [];
@@ -469,8 +489,9 @@ export class ApifyDataset implements INodeType {
 				}
 			}
 
-			// When batching is active, stop once the minCompanies threshold is
-			// met — or immediately after the first batch when no minimum is set.
+			batchStart += batchSize;
+
+			// When batching: keep going only if minCompanies threshold is not met
 			if (runsPerBatch > 0) {
 				if (minCompanies <= 0 || jobsByCompany.size >= minCompanies) {
 					break;
@@ -478,7 +499,13 @@ export class ApifyDataset implements INodeType {
 			}
 		}
 
-		// Phase 3: Build output — one item per company, or all in a single item
+		// Persist lightweight state for next iteration
+		context.seenKeys = [...seenKeys];
+		context.filteredKeys = [...filteredKeys];
+
+		const hasMoreRuns = batchStart < allRuns.length;
+
+		// ── Build output for this batch ───────────────────────────────
 		const companies: IDataObject[] = [];
 		for (const [normalizedName, jobs] of jobsByCompany) {
 			const first = jobs[0];
@@ -494,12 +521,21 @@ export class ApifyDataset implements INodeType {
 		}
 		jobsByCompany.clear();
 
+		let batchItems: INodeExecutionData[];
 		if (returnSingleItem) {
-			return [[{ json: { companies } }]];
+			batchItems = [{ json: { companies } }];
+		} else {
+			batchItems = companies.map((c) => ({ json: c }));
 		}
 
-		const returnData: INodeExecutionData[] = companies.map((c) => ({ json: c }));
-		return [returnData];
+		// ── Route to outputs ──────────────────────────────────────────
+		if (runsPerBatch > 0 && hasMoreRuns) {
+			// More batches to come → send to Loop Body, nothing to Done
+			return [batchItems, []];
+		}
+
+		// Final batch (or no batching) → send to Done
+		return [[], batchItems];
 	}
 }
 
