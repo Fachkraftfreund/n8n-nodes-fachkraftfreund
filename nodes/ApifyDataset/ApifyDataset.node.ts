@@ -499,11 +499,18 @@ export class ApifyDataset implements INodeType {
 			}
 		}
 
-		// Persist lightweight state for next iteration
-		context.seenKeys = [...seenKeys];
-		context.filteredKeys = [...filteredKeys];
-
 		const hasMoreRuns = batchStart < allRuns.length;
+
+		if (hasMoreRuns) {
+			// Persist lightweight state for next iteration
+			context.seenKeys = [...seenKeys];
+			context.filteredKeys = [...filteredKeys];
+		} else {
+			// Final batch — free context memory
+			delete context.allRuns;
+			delete context.seenKeys;
+			delete context.filteredKeys;
+		}
 
 		// ── Build output for this batch ───────────────────────────────
 		const companies: IDataObject[] = [];
