@@ -554,6 +554,7 @@ async function collectRuns(
 	cutoff: string,
 ): Promise<ApifyRun[]> {
 	const matching: ApifyRun[] = [];
+	const cutoffMs = new Date(cutoff).getTime();
 	let offset = 0;
 
 	while (true) {
@@ -574,7 +575,7 @@ async function collectRuns(
 		let anyMatchOnPage = false;
 		for (const run of runs) {
 			if (!run.defaultDatasetId) continue;
-			if (run.startedAt >= cutoff) {
+			if (new Date(run.startedAt).getTime() >= cutoffMs) {
 				matching.push(run);
 				anyMatchOnPage = true;
 			}
