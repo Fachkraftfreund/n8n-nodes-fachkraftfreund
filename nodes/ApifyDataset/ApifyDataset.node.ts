@@ -391,6 +391,24 @@ export class ApifyDataset implements INodeType {
 
 		const context = this.getContext('node');
 
+		// ── Accumulate loop body results (on re-entry from Loop Body) ─
+		if (context.initialized === true) {
+			const inputItems = this.getInputData();
+			if (!context.loopResults) {
+				context.loopResults = [];
+			}
+			for (const item of inputItems) {
+				(context.loopResults as IDataObject[]).push(item.json);
+			}
+		}
+
+		// ── Done callback: all runs processed in a previous call ──────
+		if (context.initialized === true && !context.allRuns) {
+			const results = (context.loopResults ?? []) as IDataObject[];
+			delete context.loopResults;
+			return [[], results.map((json) => ({ json }))];
+		}
+
 		// ── First iteration: collect run metadata ──────────────────────
 		if (context.initialized !== true) {
 			const cutoff = new Date(startDate).toISOString();
@@ -536,12 +554,14 @@ export class ApifyDataset implements INodeType {
 		}
 
 		// ── Route to outputs ──────────────────────────────────────────
-		if (runsPerBatch > 0 && hasMoreRuns) {
-			// More batches to come → send to Loop Body, nothing to Done
+		if (runsPerBatch > 0) {
+			// Always send through Loop Body when batching — the next
+			// call will hit the "done callback" early-return above once
+			// context.allRuns has been cleaned up.
 			return [batchItems, []];
 		}
 
-		// Final batch (or no batching) → send to Done
+		// No batching → send everything to Done in one go
 		return [[], batchItems];
 	}
 }
