@@ -486,7 +486,7 @@ export class ApifyDataset implements INodeType {
 						const key = normalize(name) ?? '';
 
 						if (filteredKeys.has(key)) continue;
-						if (seenKeys.has(key)) continue;
+						if (seenKeys.has(key) && !jobsByCompany.has(key)) continue;
 
 						if (isFilteredCompany(name)) {
 							filteredKeys.add(key);
