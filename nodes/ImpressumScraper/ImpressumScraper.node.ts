@@ -1649,6 +1649,9 @@ function extractHomepageLinkFromDirectory(html: string, directoryUrl: string): s
 	while ((match = linkRegex.exec(html)) !== null) {
 		const href = match[1].trim();
 		const fullTag = match[0];
+		// Guard against non-greedy capture spanning huge HTML (missing/distant </a>) —
+		// calling .replace() on multi-MB strings can overflow V8's regex stack.
+		if (match[2].length > 5000) continue;
 		const linkText = match[2].replace(/<[^>]+>/g, '').trim();
 
 		if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) continue;
@@ -1728,6 +1731,7 @@ function findFallbackUrls(html: string, baseUrl: string): string[] {
 
 	while ((match = linkRegex.exec(html)) !== null) {
 		const href = match[1].trim();
+		if (match[2].length > 5000) continue;
 		const linkText = match[2].replace(/<[^>]+>/g, '').trim();
 
 		if (FALLBACK_HREF.test(href) || FALLBACK_TEXT.test(linkText)) {
@@ -1755,6 +1759,7 @@ function findImpressumUrl(html: string, baseUrl: string): string | null {
 
 	while ((match = linkRegex.exec(html)) !== null) {
 		const href = match[1].trim();
+		if (match[2].length > 5000) continue;
 		const linkText = match[2].replace(/<[^>]+>/g, '').trim().toLowerCase();
 		let score = 0;
 		const hrefLower = href.toLowerCase();
