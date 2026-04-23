@@ -821,9 +821,60 @@ export class ImpressumScraper implements INodeType {
 			job.impressumHtml = undefined;
 		}
 
+		// ── Phase 5d: Aggregator / directory detection ──────────────
+		// When ≥ 3 different input companies in the same batch end up on the
+		// exact same impressumUrl, the page is an aggregator's own impressum
+		// (e.g. ziegler-physiotherapie.de, suchehandwerker.de, physio.de).
+		// Reject those scrapes — the extracted data belongs to the directory,
+		// not the queried company.
+		{
+			const impressumCounts = new Map<string, number>();
+			for (const { job } of successfulJobs) {
+				if (job.impressumUrl) {
+					impressumCounts.set(job.impressumUrl, (impressumCounts.get(job.impressumUrl) || 0) + 1);
+				}
+			}
+			const aggregatedUrls = new Set<string>();
+			for (const [url, n] of impressumCounts) {
+				if (n >= 3) aggregatedUrls.add(url);
+			}
+			if (aggregatedUrls.size > 0) {
+				const kept: Array<{ job: ScrapeJob; data: ImpressumResult; text: string }> = [];
+				for (const entry of successfulJobs) {
+					const url = entry.job.impressumUrl;
+					if (url && aggregatedUrls.has(url)) {
+						returnData.push({
+							json: {
+								inputCompanyName: entry.job.companyName,
+								inputCity: entry.job.city,
+								sourceUrl: entry.job.inputUrl,
+								impressumUrl: url,
+								error: `Aggregator impressum hit by ${impressumCounts.get(url)} jobs in this batch — rejected to avoid overwriting real company data with directory data`,
+								success: false,
+							},
+							pairedItem: { item: entry.job.itemIndex },
+						});
+					} else {
+						kept.push(entry);
+					}
+				}
+				successfulJobs.length = 0;
+				successfulJobs.push(...kept);
+			}
+		}
+
 		// ── Phase 6: Plausibility check + OpenAI enrichment ─────────
 		if (openAiKey && successfulJobs.length > 0) {
 			await enrichWithOpenAi(this, successfulJobs, openAiKey, openAiModel);
+		}
+
+		// ── Phase 6b: Focused person-recovery for rows where the scraper
+		// produced a valid companyName but no lastName. A dedicated OpenAI
+		// call with a prompt tailored to "find the primary responsible
+		// person in this Impressum" recovers cases where the generic
+		// enrichment missed a name that is actually on the page.
+		if (openAiKey && successfulJobs.length > 0) {
+			await recoverMissingPersons(this, successfulJobs, openAiKey, openAiModel);
 		}
 
 		// Free impressum text — no longer needed after enrichment
@@ -1473,6 +1524,31 @@ function isPlausible(data: ImpressumResult): boolean {
 }
 
 /**
+ * Cleans an AI-extracted companyName: decode entities, strip comment/SEO tails,
+ * strip leading Herr/Frau + title salutations, then apply NAME_REJECT_RE.
+ * Returns null if the cleaned value should be rejected.
+ *
+ * NOTE: defined here as a forward reference — NAME_REJECT_RE is declared later
+ * in the file but both live in the same module scope.
+ */
+function sanitizeAiCompanyName(value: unknown): string | null {
+	if (value == null) return null;
+	let s = String(value);
+	s = decodeHtmlEntities(s)
+		.replace(/\s*-->\s*/g, ' ')
+		.split(/\s*\|\s*/)[0]
+		.split(/\s*-->\s*/)[0]
+		.replace(/\s+/g, ' ')
+		.trim();
+	// Strip leading salutation + titles so "Herr Prof. Dr. X" becomes usable.
+	s = s.replace(/^(?:Herr(?:n)?|Frau)\s+/i, '');
+	if (s.length < 3 || s.length > 150) return null;
+	if (NAME_REJECT_RE.test(s)) return null;
+	if (looksLikeAddressString(s)) return null;
+	return s;
+}
+
+/**
  * 1. Checks plausibility of regex results — implausible items get a full OpenAI re-parse
  * 2. For plausible items with null fields, enriches only the missing fields via OpenAI
  */
@@ -1529,6 +1605,12 @@ async function enrichWithOpenAi(
 				for (const field of allFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
 						if (field === 'postalCode' && !isValidPostalCode(String(extracted[field]))) continue;
+						if (field === 'companyName') {
+							const cleaned = sanitizeAiCompanyName(extracted[field]);
+							if (cleaned === null) continue;
+							data[field] = cleaned;
+							continue;
+						}
 						if (ARRAY_FIELDS.has(field)) {
 							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
@@ -1567,6 +1649,11 @@ async function enrichWithOpenAi(
 				for (const field of missingFields) {
 					if (extracted[field] != null && extracted[field] !== '') {
 						if (field === 'postalCode' && !isValidPostalCode(String(extracted[field]))) continue;
+						if (field === 'companyName' && data[field] === null) {
+							const cleaned = sanitizeAiCompanyName(extracted[field]);
+							if (cleaned !== null) data[field] = cleaned;
+							continue;
+						}
 						if (ARRAY_FIELDS.has(field) && (data[field] as unknown[]).length === 0) {
 							let arr = Array.isArray(extracted[field])
 								? (extracted[field] as string[]).map(String)
@@ -1580,6 +1667,123 @@ async function enrichWithOpenAi(
 				}
 			}
 		}
+	}
+}
+
+/**
+ * Phase 6b: focused person-recovery. For jobs where the scraper has a usable
+ * companyName but no lastName, call OpenAI with a tight prompt asking
+ * specifically for the primary responsible natural person. Only *fills* null
+ * fields — never overrides existing values. Runs with the same concurrency
+ * cap as the main enrichment.
+ */
+async function recoverMissingPersons(
+	ctx: IExecuteFunctions,
+	results: Array<{ data: ImpressumResult; text: string }>,
+	openAiKey: string,
+	model: string,
+): Promise<void> {
+	const targets: number[] = [];
+	for (let i = 0; i < results.length; i++) {
+		const data = results[i].data;
+		const companyOk =
+			!!data.companyName &&
+			data.companyName.length >= 3 &&
+			data.companyName.length <= 150 &&
+			!NAME_REJECT_RE.test(data.companyName);
+		const personMissing = !data.lastName || data.lastName.trim().length < 2;
+		if (companyOk && personMissing) targets.push(i);
+	}
+	if (targets.length === 0) return;
+
+	for (let i = 0; i < targets.length; i += OPENAI_CONCURRENCY) {
+		const batch = targets.slice(i, i + OPENAI_CONCURRENCY);
+		const responses = await Promise.allSettled(
+			batch.map((idx) =>
+				callPersonExtraction(
+					ctx,
+					results[idx].text,
+					results[idx].data.companyName || '',
+					openAiKey,
+					model,
+				),
+			),
+		);
+		for (let j = 0; j < batch.length; j++) {
+			const resp = responses[j];
+			if (resp.status !== 'fulfilled' || !resp.value) continue;
+			const idx = batch[j];
+			const data = results[idx].data;
+			const p = resp.value;
+
+			const candidate: { firstName: string | null; lastName: string | null; salutation: string | null; title: string | null } = {
+				firstName: typeof p.firstName === 'string' && p.firstName.trim() ? p.firstName.trim() : null,
+				lastName: typeof p.lastName === 'string' && p.lastName.trim() ? p.lastName.trim() : null,
+				salutation: typeof p.salutation === 'string' && p.salutation.trim() ? p.salutation.trim() : null,
+				title: typeof p.title === 'string' && p.title.trim() ? p.title.trim() : null,
+			};
+
+			// Sanity-check the AI output with the same filters as the regex path.
+			if (isRejectedPerson(candidate.firstName, candidate.lastName)) continue;
+			if (!candidate.firstName && !candidate.lastName) continue;
+
+			// Only fill nulls — never override.
+			if (!data.lastName && candidate.lastName) data.lastName = candidate.lastName;
+			if (!data.firstName && candidate.firstName) data.firstName = candidate.firstName;
+			if (!data.salutation && candidate.salutation) {
+				const s = candidate.salutation.replace(/^Herrn$/i, 'Herr');
+				if (/^(Herr|Frau)$/i.test(s)) data.salutation = s;
+			}
+			if (!data.title && candidate.title) data.title = candidate.title;
+		}
+	}
+}
+
+async function callPersonExtraction(
+	ctx: IExecuteFunctions,
+	impressumText: string,
+	companyName: string,
+	apiKey: string,
+	model: string,
+): Promise<Record<string, unknown> | null> {
+	const truncated = impressumText.length > 4000 ? impressumText.substring(0, 4000) : impressumText;
+	try {
+		const response = await ctx.helpers.httpRequest({
+			method: 'POST',
+			url: 'https://api.openai.com/v1/chat/completions',
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json',
+			},
+			body: {
+				model,
+				temperature: 0,
+				response_format: { type: 'json_object' },
+				messages: [
+					{
+						role: 'system',
+						content:
+							'You are given the Impressum/legal-notice text of a German business. Identify the single primary responsible natural person for this Impressum — typically whoever appears as Inhaber, Geschäftsführer, Praxisinhaber, or under "Vertreten durch" / "Verantwortlich für den Inhalt". ' +
+							'If two people are listed as equal co-managers (e.g. "Vertreten durch: Dr. Müller und Dr. Schmidt"), return the first one. ' +
+							'If no single responsible natural person can be identified (pure corporate imprint with no named Geschäftsführer, or a multi-partner GbR without single managing partner), return {}. ' +
+							'Never return streets, addresses, cities, titles, or placeholder text. Never guess. ' +
+							'Return JSON with these optional fields: ' +
+							'firstName (given name, e.g. "Marc"), lastName (family name, e.g. "Müller"), ' +
+							'salutation ("Herr" or "Frau"), title (academic titles only, space-separated, e.g. "Dr. med. dent.").',
+					},
+					{
+						role: 'user',
+						content: `Company: ${companyName}\n\nImpressum text:\n---\n${truncated}\n---`,
+					},
+				],
+			},
+			timeout: 30000,
+		});
+		const content = response?.choices?.[0]?.message?.content;
+		if (!content) return null;
+		return JSON.parse(content);
+	} catch {
+		return null;
 	}
 }
 
@@ -1889,11 +2093,36 @@ function htmlToText(html: string): string {
 // Result Sanitization
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const ENTITY_MAP: Record<string, string> = {
+	'&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'",
+	'&nbsp;': ' ', '&shy;': '', '&sect;': '§', '&reg;': '®', '&copy;': '©',
+	'&trade;': '™', '&times;': '×', '&middot;': '·', '&bull;': '•',
+	'&laquo;': '«', '&raquo;': '»', '&ldquo;': '"', '&rdquo;': '"',
+	'&lsquo;': "'", '&rsquo;': "'", '&ndash;': '–', '&mdash;': '—',
+	'&hellip;': '…', '&deg;': '°',
+	'&ouml;': 'ö', '&auml;': 'ä', '&uuml;': 'ü',
+	'&Ouml;': 'Ö', '&Auml;': 'Ä', '&Uuml;': 'Ü', '&szlig;': 'ß',
+	'&eacute;': 'é', '&Eacute;': 'É', '&egrave;': 'è', '&Egrave;': 'È',
+	'&ecirc;': 'ê', '&agrave;': 'à', '&ccedil;': 'ç',
+	'&uacute;': 'ú', '&aacute;': 'á', '&iacute;': 'í', '&oacute;': 'ó',
+};
+
+function decodeHtmlEntities(s: string): string {
+	let out = s;
+	for (const [ent, ch] of Object.entries(ENTITY_MAP)) out = out.split(ent).join(ch);
+	out = out.replace(/&#(\d+);/g, (_, d: string) => String.fromCharCode(parseInt(d, 10)));
+	out = out.replace(/&#x([0-9a-fA-F]+);/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+	return out;
+}
+
 function sanitizeString(value: string): string {
-	return value
-		.replace(/\x00/g, '')                // null bytes
-		.replace(/\\u[0-9a-fA-F]{4}/g, '')   // unicode escape sequences
-		.replace(/\\/g, '');                  // stray backslashes
+	return decodeHtmlEntities(value)
+		.replace(/\x00/g, '')                      // null bytes
+		.replace(/\\u[0-9a-fA-F]{4}/g, '')         // unicode escape sequences
+		.replace(/\\/g, '')                        // stray backslashes
+		.replace(/\s*-->\s*/g, ' ')                // HTML-comment leak markers ("--> --> -->")
+		.replace(/\s{2,}/g, ' ')
+		.trim();
 }
 
 function sanitizeResult(data: ImpressumResult): void {
@@ -2403,6 +2632,30 @@ function splitBusinessAndRegulatory(section: string): {
 
 // ─── Field Extractors ────────────────────────────────────────────────────────
 
+// Prefixes that indicate the "companyName" we'd extract is actually a
+// section heading, legal-text intro, nav label, template placeholder or
+// HTML fragment. Final output matching this is discarded.
+const NAME_REJECT_RE =
+	/^(?:Haftung|Seitenbetreiber|Betreiber|Start\b|Startseite|Home\b|Hauptmen[üu]|Seiten\b|Facebook\b|Imprint\b|Legal\s+Notice|Nutzungsbedingungen|Anbieterkennzeichnung|Anbieter\b|Inhaltlich\s+Verantwortlich|Informationspflicht|Information\s+gem[äa][ßs]|Medieninhaber|Herausgeber|Anschrift\b|Hier\s+finden\s+Sie|oder\s+via|Die\s+Internetseite|Der\s+gesamte|Betreuung\s+der|Volltextsuche|Allgemeine\s+Liefer|GENDER-HINWEIS|Frau\s+[A-ZÄÖÜ]|Herr\s+[A-ZÄÖÜ]|Wir\s+bem[üu]hen|Mein\s+Team|\d+\.\s+[A-ZÄÖÜ]|OnePress\s+Theme|Theme\s+von|Design\s+(?:by|von)|Powered\s+(?:by|von)|©\s*\d{4}|\$event\b|\$\(|document\.|window\.|E\s+ma\s*il|⭐|☎|☰|→|↓|↑|»|«|\p{Extended_Pictographic})/iu;
+
+/**
+ * Secondary reject: long name that looks like it contains a full address
+ * (e.g. "Zahnarztpraxis Arendt Sabine Arendt Dr.-Kurt-Fischer-Straße 10A 06888 Lutherstadt").
+ * The parser slurped the whole 'name + street + postal_code + city' block.
+ */
+function looksLikeAddressString(name: string): boolean {
+	if (name.length < 50) return false;
+	// Contains street word followed by house number, OR PLZ-style 5-digit block
+	const hasStreetNum = /\b\S+?(?:straße|strasse|weg|allee|ring|platz|gasse|damm|ufer|\bstr\.?)\s+\d/i.test(name);
+	const hasPostalBlock = /\b\d{4,5}\s+[A-ZÄÖÜ][a-zäöüß]/.test(name);
+	return hasStreetNum && hasPostalBlock;
+}
+
+// Matches an intro line with a colon-separated value, e.g.
+// "Betreiber der Website: Zahnarztpraxis Dr. X" → captures "Zahnarztpraxis Dr. X".
+const INTRO_LABEL_RE =
+	/^(?:Seitenbetreiber(?:\s+i\.?\s*S\.?\s*d\.?\s*§?\s*\d+\s*TMG)?|Betreiber(?:\s+(?:der\s+Website|dieses\s+Internetauftrittes?))?|Anbieter(?:kennzeichnung[^:]*)?|Medieninhaber(?:\s*,\s*Herausgeber[^:]*)?|Herausgeber|Inhaltlich\s+Verantwortlich(?:er)?(?:\s+gem[äa][ßs][^:]*)?)\s*:\s*(.+)$/i;
+
 function extractCompanyName(businessText: string): string | null {
 	const lines = businessText
 		.split('\n')
@@ -2426,6 +2679,7 @@ function extractCompanyName(businessText: string): string | null {
 		/^(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)/i,
 		/^(?:Alle\s+Rechte|All\s+rights|Copyright\b)/i,
 		/^(?:Zurück|Weiter|Seite\s+\d|Mehr\s+erfahren|Weiterlesen|Jetzt\s+)/i,
+		NAME_REJECT_RE,
 	];
 
 	let startLine = 0;
@@ -2448,6 +2702,15 @@ function extractCompanyName(businessText: string): string | null {
 		if (i + 1 < lines.length && lines[i + 1].length >= 3 && lines[i + 1].length <= 150) {
 			return lines[i + 1];
 		}
+	}
+
+	// Intro-label pattern: "Betreiber der Website: Zahnarztpraxis Dr. X", "Seitenbetreiber: Y GmbH",
+	// "Inhaltlich Verantwortlicher gemäß § 5 DDG: Viviane Schubert". Take the value side.
+	for (let i = startLine; i < Math.min(startLine + 10, lines.length); i++) {
+		const introMatch = lines[i].match(INTRO_LABEL_RE);
+		if (!introMatch) continue;
+		const value = introMatch[1].trim();
+		if (value.length >= 3 && value.length <= 150 && !NAME_REJECT_RE.test(value)) return value;
 	}
 
 	// Collect and score candidates instead of returning the first match
@@ -2504,7 +2767,14 @@ function extractCompanyName(businessText: string): string | null {
 	if (candidates.length === 0) return null;
 
 	candidates.sort((a, b) => b.score - a.score);
-	return candidates[0].line;
+	const pick = candidates[0].line;
+	// Final safety net: never return a heading/nav/legal-intro as companyName.
+	// Also strip SEO spam tails ("Company Name | Some SEO blurb --> -->"), keep the first segment.
+	const cleaned = pick.split(/\s*\|\s*/)[0].split(/\s*-->\s*/)[0].trim();
+	if (cleaned.length < 3 || cleaned.length > 150) return null;
+	if (NAME_REJECT_RE.test(cleaned)) return null;
+	if (looksLikeAddressString(cleaned)) return null;
+	return cleaned;
 }
 
 interface PersonInfo {
@@ -2514,112 +2784,203 @@ interface PersonInfo {
 	lastName: string | null;
 }
 
-function extractPersonName(businessText: string): PersonInfo {
+// Tokens that MUST NOT appear as firstName (German street prepositions + role words).
+// An address line like "An der Krusau 7" mis-parsed as first="An" last="Krusau" triggers this.
+const FIRST_NAME_REJECT = new Set([
+	'Am', 'An', 'Auf', 'In', 'Bei', 'Zum', 'Zur', 'Hinter', 'Vor',
+	'Unter', 'Über', 'Ueber', 'Neben', 'Der', 'Die', 'Das', 'Haupt',
+	'Dortelweiler', 'Potsdamer', 'Brunsbütteler',
+	'Stadt', 'Markt',
+	'Geschäftsführer', 'Geschäftsführerin', 'Inhaber', 'Inhaberin',
+	'Betreiber', 'Betreiberin', 'Herausgeber', 'Verantwortlich',
+	'Vertreten', 'Leitung', 'Praxisleitung',
+	'Physiotherapiepraxis', 'Zahnarztpraxis', 'Environmental', 'Impressum',
+]);
+
+// Tokens that MUST NOT appear as lastName — address suffixes, title fragments,
+// generic field-labels that the parser slurped past the actual name.
+const LAST_NAME_REJECT = new Set([
+	'Dipl.', 'Dr.', 'Prof.', 'D.',
+	'Platz', 'Straße', 'Str.', 'Weg', 'Allee', 'Ring', 'Gasse', 'Hof',
+	'Bauhof', 'Markt', 'Anschrift',
+	'LLC', 'Expert', 'Sanum',
+	'Umsatzsteueridentifikationsnummer:', 'USt-IdNr.:', 'UStIdNr.:',
+]);
+
+// Token-level test: does this single word look like a company suffix rather
+// than a personal name? Catches "Schmerzfreizentrum" / "Zahnzentrum" /
+// "Physiotherapiepraxis" / "Therapiezentrum" etc. — all company words the
+// AI sometimes confidently returns as firstName/lastName.
+const COMPANY_WORD_TOKEN_RE =
+	/(?:praxis|praxen|zentrum|klinik|kliniken|therapie|institut|apotheke|gesundheit|medizin|naturheilkunde|zahnheilkunde|kieferorthop[äa]die|ambulatorium|sanat(?:orium)|zahnarzt|zahnärzte|physio|implantologie|mvz|gbr|gmbh|(?:^|\s)ag$|kg|ohg|\bug\b|mbh|mbb|eV|partnerschaft|sellwerk)$/i;
+
+function looksLikeCompanyWord(token: string): boolean {
+	if (token.length < 3) return false;
+	return COMPANY_WORD_TOKEN_RE.test(token);
+}
+
+function isRejectedPerson(first: string | null, last: string | null): boolean {
+	if (first && FIRST_NAME_REJECT.has(first)) return true;
+	if (last && LAST_NAME_REJECT.has(last)) return true;
+	// Single-token company words sneaking in as first/last name.
+	if (first && looksLikeCompanyWord(first)) return true;
+	if (last && looksLikeCompanyWord(last)) return true;
+	// Multi-word lastName whose FIRST token is a company word
+	// (e.g. lastName "Zahnzentrum Zahnengel" — company name leaked into person).
+	if (last) {
+		const firstTok = last.split(/\s+/)[0];
+		if (firstTok && looksLikeCompanyWord(firstTok)) return true;
+	}
+	// Both tokens missing any lowercase letters → probably ALL CAPS navigation/headings
+	if (first && last && !/[a-zäöüß]/.test(first + last)) return true;
+	return false;
+}
+
+// Tokens that separate company-speak from the real person name. A value like
+// "Zahnarztpraxis am Schloss Köpenick Olaf Vogel" needs to skip the leading
+// five tokens to reach the actual firstName.
+const NON_NAME_TOKEN_RE =
+	/^(?:Dr\.?|Prof\.?|Dipl\.?|M\.?\s*Sc\.?|B\.?\s*Sc\.?|M\.?\s*A\.?|med\.?|dent\.?|rer\.?|nat\.?|phil\.?|jur\.?|Stom\.?|Ing\.?|Kfm\.?|Psych\.?|GmbH|AG|KG|OHG|GbR|UG|mbH|mbb|e\.?K\.?|e\.?V\.?|Co\.?|Ltd\.?|Partnerschaft|Praxis\w*|Zahnarzt\w*|Zahn(?:ärzt|arzt)\w*|Kieferorthop[aä]d\w*|Gemeinschaftspraxis|Praxisgemeinschaft|Klinik\w*|Zentrum|Institut|Physiotherapie\w*|MVZ|Heilpraktiker|Dental\w*|Arztpraxis|Kinderzahnarztpraxis|Ordination|am|an|auf|in|bei|im|zur|zum|von|der|die|das|und|dem|des|Haus|Schloss|&)$/i;
+
+const NAME_TOKEN_RE =
+	/^(?:[A-ZÄÖÜ][a-zäöüß]+(?:-[A-ZÄÖÜ][a-zäöüß]+)?|[A-ZÄÖÜ]\.)$/;
+
+/**
+ * Parses a single candidate value (the string captured after a label like
+ * "Vertreten durch:") into a PersonInfo. Returns null if nothing usable was
+ * found. Skips leading company-speak so values that lead with a company name
+ * still yield the buried person (common in small practices: "Zahnarztpraxis
+ * Peter Veit" → Peter Veit).
+ */
+function parsePersonFromLabelValue(input: string): PersonInfo | null {
 	const result: PersonInfo = { salutation: null, title: null, firstName: null, lastName: null };
 
-	const nameContextPatterns = [
-		/(?:Inhaber(?:in)?|Praxisinhaber(?:in)?)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Vertreten\s+durch|Vertretungsberechtigt(?:er)?)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Geschäftsführer(?:in)?|Geschäftsleitung)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Verantwortlich\s+(?:für\s+den\s+Inhalt|i\.?\s*S\.?\s*d\.?\s*§|im\s+Sinne|gemäß)[^:]*)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Inhaltlich\s+Verantwortlich(?:er)?)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Verantwortlich\s+(?:nach|gem))[^:]*\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Leitung|Praxisleitung)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Betreiber(?:in)?)\s*[.:]\s*\n?\s*(.+)/i,
-		/(?:Zahnärztlicher\s+Leiter(?:in)?)\s*[.:]\s*\n?\s*(.+)/i,
+	// Keep only the first person if multiple are listed with & / "und" / ","
+	let s = input
+		.split(/\s*(?:&|\s+und\s+)\s*/)[0].trim()
+		.split(/\s*,\s*/)[0].trim()
+		.replace(/\s*\([^)]*\)/g, '')
+		.replace(/\s*[-–]\s+\S.*$/, '')
+		.trim();
+	if (!s) return null;
+
+	// Salutation prefix
+	const salu = s.match(/^(Herr(?:n)?|Frau)\s+/i);
+	if (salu) {
+		result.salutation = salu[1].replace(/^Herrn$/i, 'Herr');
+		s = s.substring(salu[0].length).trim();
+	}
+
+	// Title prefixes (may stack)
+	const titles: string[] = [];
+	let advanced = true;
+	while (advanced) {
+		advanced = false;
+		const titlePatterns = [
+			/^Prof\.?\s*/i,
+			/^Dr\.?\s*(?:med\.?\s*(?:dent\.?\s*)?|rer\.?\s*nat\.?\s*|phil\.?\s*|jur\.?\s*|h\.?\s*c\.?\s*)?/i,
+			/^Dipl\.?\s*-?\s*(?:Stom\.?|Med\.?|Ing\.?|Kfm\.?|Kff\.?|Wirt\w*\.?|Psych\.?|Päd\.?|Volksw\w*\.?|Betriebsw\w*\.?)\s*/i,
+			/^M\.?\s*Sc\.?\s*/i,
+			/^B\.?\s*Sc\.?\s*/i,
+			/^M\.?\s*A\.?\s*/i,
+		];
+		for (const re of titlePatterns) {
+			const m = s.match(re);
+			if (m) { titles.push(m[0].trim()); s = s.substring(m[0].length).trim(); advanced = true; break; }
+		}
+	}
+	if (titles.length) result.title = titles.join(' ');
+
+	// Tokenize and skip leading non-name tokens (company speak, residual titles)
+	let tokens = s.split(/\s+/).filter((t) => t.length > 0);
+	while (tokens.length > 0 && NON_NAME_TOKEN_RE.test(tokens[0])) tokens.shift();
+	// After skipping, also skip tokens that aren't plausible name tokens
+	while (tokens.length > 0 && !NAME_TOKEN_RE.test(tokens[0])) tokens.shift();
+
+	if (tokens.length === 0) return null;
+
+	// Prefer first two consecutive name tokens (firstName + lastName)
+	if (tokens.length >= 2 && NAME_TOKEN_RE.test(tokens[0]) && NAME_TOKEN_RE.test(tokens[1])) {
+		// Reject single-letter-with-dot as firstName (it's an initial — lastName will be next token)
+		if (/^[A-ZÄÖÜ]\.$/.test(tokens[0]) && NAME_TOKEN_RE.test(tokens[1]) && !/^[A-ZÄÖÜ]\.$/.test(tokens[1])) {
+			// "P. Müller" — treat as initialed firstName
+			result.firstName = tokens[0];
+			result.lastName = tokens[1];
+		} else {
+			result.firstName = tokens[0];
+			// Allow a hyphenated lastName to span two tokens if joined with dash
+			result.lastName = tokens[1];
+		}
+		return result;
+	}
+
+	// Single token → lastName only
+	result.lastName = tokens[0];
+	return result;
+}
+
+function extractPersonName(businessText: string): PersonInfo {
+	const empty: PersonInfo = { salutation: null, title: null, firstName: null, lastName: null };
+
+	// Label-based candidates. Ordered most → least specific. Colon is optional —
+	// some impressums write "Vertreten durch Rainer Gleß" without punctuation.
+	// Value is everything up to the next newline.
+	const labelPatterns: RegExp[] = [
+		/(?:^|\n|\s)(?:Praxisinhaber(?:in)?|Inhaber(?:in)?(?:\s+der\s+Praxis)?)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:Vertreten\s+durch|Vertretungsberechtigt(?:er|e)?)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:Gesch[äa]ftsf[üu]hrer(?:in)?|Gesch[äa]ftsleitung)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:Inhaltlich\s+Verantwortlich(?:er)?(?:\s+(?:gem(?:äß)?|nach)[^\n:]*)?)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:Verantwortlich\s+(?:für\s+den\s+Inhalt|i\.?\s*S\.?\s*d\.?\s*§|im\s+Sinne|gemäß|nach\s+§|gem\.?\s+§)[^\n:]*)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:(?:Praxis)?Leitung|Praxisleiter(?:in)?|Zahnärztlicher\s+Leiter(?:in)?)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
+		/(?:^|\n|\s)(?:Betreiber(?:in)?(?:\s+(?:der\s+(?:Website|Webseite|Seite|Internetpräsenz)|dieser\s+(?:Website|Seite|Webseite|Internetpräsenz)|dieses\s+(?:Onlineangebotes|Internetauftrittes?)))?)\s*[.:]?\s*\n?\s*([^\n]+(?:\n\s*[^\n]+){0,2})/gi,
 	];
 
-	let nameString: string | null = null;
-
-	for (const pattern of nameContextPatterns) {
-		const match = businessText.match(pattern);
-		if (match) {
-			nameString = match[1].trim();
-			if (nameString.length > 80 || /^§|^(?:Die|Der|Das|Ein|Eine)\s/i.test(nameString)) {
-				nameString = null;
-				continue;
+	const candidates: string[] = [];
+	for (const pattern of labelPatterns) {
+		for (const m of businessText.matchAll(pattern)) {
+			const block = m[1]?.trim();
+			if (!block) continue;
+			// Split the 1–3 captured lines into individual candidates so each is
+			// tried separately. The first line often holds the company name; the
+			// person is on line 2 or 3.
+			const lines = block.split(/\n/).map((l) => l.trim()).filter((l) => l.length >= 3 && l.length <= 200);
+			for (const v of lines) {
+				if (/^§|^(?:Die|Der|Das|Ein|Eine)\s|^und\s|^sowie\s/i.test(v)) continue;
+				if (/\b(?:ist|sind|werden|haben|kann|können|sollen|bitte|unsere[nmrs]?|diese[nmrs]?)\b/i.test(v)) continue;
+				candidates.push(v);
 			}
-			break;
 		}
 	}
 
-	if (!nameString) {
-		const lines = businessText
-			.split('\n')
-			.map((l) => l.trim())
-			.filter((l) => l.length > 0);
+	// Fallback: postal-code anchor. The 3 lines preceding "12345 Stadt" often hold the person.
+	if (candidates.length === 0) {
+		const lines = businessText.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
 		for (let i = 0; i < lines.length; i++) {
 			if (/^\d{5}\s+[A-ZÄÖÜ]/.test(lines[i])) {
 				for (let j = Math.max(0, i - 3); j < i; j++) {
-					if (looksLikePersonName(lines[j])) {
-						nameString = lines[j];
-						break;
-					}
+					if (looksLikePersonName(lines[j])) candidates.push(lines[j]);
 				}
 				break;
 			}
 		}
 	}
 
-	if (!nameString) return result;
-
-	nameString = nameString.split(/\s*(?:&|(?:\s+und\s+))\s*/)[0].trim();
-	nameString = nameString.split(/\s*,\s*/)[0].trim();
-	nameString = nameString.replace(/\s*\(.*\)/, '');
-	nameString = nameString.replace(/\s*[-–].*$/, '');
-
-	const salutationMatch = nameString.match(/^(Herr(?:n)?|Frau)\s+/i);
-	if (salutationMatch) {
-		result.salutation = salutationMatch[1].replace(/^Herrn$/i, 'Herr');
-		nameString = nameString.substring(salutationMatch[0].length).trim();
+	// Two-pass: first prefer candidates that yield BOTH firstName and lastName,
+	// then fall back to candidates with just a lastName.
+	for (const candidate of candidates) {
+		const parsed = parsePersonFromLabelValue(candidate);
+		if (!parsed) continue;
+		if (isRejectedPerson(parsed.firstName, parsed.lastName)) continue;
+		if (parsed.firstName && parsed.lastName) return parsed;
+	}
+	for (const candidate of candidates) {
+		const parsed = parsePersonFromLabelValue(candidate);
+		if (!parsed) continue;
+		if (isRejectedPerson(parsed.firstName, parsed.lastName)) continue;
+		if (parsed.firstName || parsed.lastName) return parsed;
 	}
 
-	const titles: string[] = [];
-	let keepExtracting = true;
-	while (keepExtracting) {
-		keepExtracting = false;
-		const titlePatterns = [
-			/^Prof\.?\s*/i,
-			/^Dr\.?\s*(?:med\.?\s*(?:dent\.?\s*)?)?/i,
-			/^Dipl\.?[-\s]\w+\.?\s*/i,
-			/^M\.?\s*Sc\.?\s*/i,
-			/^B\.?\s*Sc\.?\s*/i,
-			/^Dipl\.\s*-?\s*Stom\.?\s*/i,
-		];
-		for (const pattern of titlePatterns) {
-			const m: RegExpMatchArray | null = nameString.match(pattern);
-			if (m) {
-				titles.push(m[0].trim());
-				nameString = nameString.substring(m[0].length).trim();
-				keepExtracting = true;
-				break;
-			}
-		}
-	}
-
-	if (titles.length > 0) {
-		result.title = titles.join(' ');
-	}
-
-	const nameParts = nameString.split(/\s+/).filter((p) => p.length > 0);
-	const validParts = nameParts.filter(
-		(p) =>
-			/^[A-ZÄÖÜ][a-zäöüß]+$/.test(p) ||
-			/^[A-ZÄÖÜ]\.$/.test(p) ||
-			/^[A-ZÄÖÜ][a-zäöüß]+-[A-ZÄÖÜ][a-zäöüß]+$/.test(p),
-	);
-
-	if (validParts.length >= 2) {
-		result.firstName = validParts[0];
-		result.lastName = validParts.slice(1).join(' ');
-	} else if (nameParts.length >= 2 && nameParts.every((p) => /^[A-ZÄÖÜ]/.test(p))) {
-		result.firstName = nameParts[0];
-		result.lastName = nameParts.slice(1).join(' ');
-	} else if (nameParts.length === 1 && /^[A-ZÄÖÜ]/.test(nameParts[0])) {
-		result.lastName = nameParts[0];
-	}
-
-	return result;
+	return empty;
 }
 
 function looksLikePersonName(line: string): boolean {
