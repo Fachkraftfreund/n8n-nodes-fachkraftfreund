@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-fachkraftfreund",
-  "version": "0.7.11",
+  "version": "0.8.0",
   "description": "n8n community nodes for Fachkraftfreund - WaliChat and Ringover integrations",
   "license": "MIT",
   "keywords": [
@@ -14,6 +14,7 @@
     "build": "tsc -p tsconfig.json && npm run copy-assets",
     "copy-assets": "node -e \"const fs=require('fs'),p=require('path');const src='nodes',dst='dist/nodes';function cp(d){fs.readdirSync(d).forEach(f=>{const s=p.join(d,f),t=p.join(dst,p.relative(src,s));fs.statSync(s).isDirectory()?cp(s):f.endsWith('.svg')&&(fs.mkdirSync(p.dirname(t),{recursive:true}),fs.copyFileSync(s,t))})}cp(src)\"",
     "dev": "tsc -w -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
     "prepublishOnly": "npm run build"
   },
   "files": [
@@ -34,7 +35,8 @@
       "dist/nodes/ImpressumScraper/ImpressumScraper.node.js",
       "dist/nodes/TeamKpiTracker/TeamKpiTracker.node.js",
       "dist/nodes/ApifyDataset/ApifyDataset.node.js",
-      "dist/nodes/ChunkedSubworkflow/ChunkedSubworkflow.node.js"
+      "dist/nodes/ChunkedSubworkflow/ChunkedSubworkflow.node.js",
+      "dist/nodes/CandidateIntake/CandidateIntake.node.js"
     ]
   },
   "devDependencies": {
