@@ -121,6 +121,28 @@ export async function patchCandidate(
 	});
 }
 
+/**
+ * Upsert a file into a public Supabase Storage bucket at `<bucket>/<objectPath>`.
+ * Uses the same `supabaseApi` service-role credential as the REST calls (its
+ * authenticate injects the auth headers); `x-upsert: true` overwrites any
+ * existing object at the path so re-processing the same candidate replaces it.
+ */
+export async function uploadToStorage(
+	ctx: IExecuteFunctions,
+	host: string,
+	bucket: string,
+	objectPath: string,
+	body: Buffer,
+	contentType: string,
+): Promise<void> {
+	await ctx.helpers.httpRequestWithAuthentication.call(ctx, SUPABASE_CREDENTIAL, {
+		method: 'POST',
+		url: `${host.replace(/\/+$/, '')}/storage/v1/object/${bucket}/${objectPath}`,
+		headers: { 'Content-Type': contentType, 'x-upsert': 'true' },
+		body,
+	});
+}
+
 /** Live submissions for a (candidate, posting group) pair. */
 export async function fetchLiveSubmissions(
 	ctx: IExecuteFunctions,

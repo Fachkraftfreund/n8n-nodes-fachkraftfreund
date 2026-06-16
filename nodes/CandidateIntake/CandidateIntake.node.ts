@@ -25,7 +25,17 @@ import {
 	insertCandidate,
 	insertSubmission,
 	patchCandidate,
+	uploadToStorage,
 } from './postgrest';
+import {
+	detectResumeType,
+	isResumeTooLarge,
+	MAX_RESUME_BYTES,
+	RESUME_BUCKET,
+	resumeObjectPath,
+	resumePublicUrl,
+	shouldUploadResume,
+} from './resume';
 import {
 	DEFAULT_SOURCE,
 	IMPORT_SOURCE,
@@ -39,7 +49,10 @@ import {
 
 // ─── Field definitions ───────────────────────────────────────────────────────
 
-const INPUT_FIELDS: { name: keyof IntakeInput; label: string }[] = [
+/** The string-valued intake inputs read by the per-item loop (excludes the boolean education_completed). */
+type StringInputField = Exclude<keyof IntakeInput, 'education_completed'>;
+
+const INPUT_FIELDS: { name: StringInputField; label: string }[] = [
 	{ name: 'firstname', label: 'First Name' },
 	{ name: 'lastname', label: 'Last Name' },
 	{ name: 'email', label: 'Email' },
@@ -161,6 +174,9 @@ export function mappedFields(
 		job_title_id: resolution.jobTitleId,
 		// Keep the raw free-text job when the title could not be resolved.
 		job_title: resolution.jobTitleName ?? trimToNull(input.job),
+		// Completed-education flag: only `true` yields a status; `false`/absent
+		// stays null so isEmptyValue drops it from both insert and enrich payloads.
+		education_status: input.education_completed === true ? 'completed' : null,
 	};
 }
 
@@ -215,7 +231,25 @@ export class CandidateIntake implements INodeType {
 		inputs: ['main'],
 		outputs: ['main'],
 		credentials: [{ name: 'supabaseApi', required: true }],
-		properties: INPUT_FIELDS.map((f) => fieldProperty(f.name, f.label)),
+		properties: [
+			...INPUT_FIELDS.map((f) => fieldProperty(f.name, f.label)),
+			{
+				displayName: 'Resume Source URL',
+				name: 'resume_source_url',
+				type: 'string',
+				default: '',
+				description:
+					'External link to download the resume file from (e.g. a Perspective upload link). Map explicitly per workflow; leave empty to skip resume capture. The downloaded file is stored in the public "resumes" bucket and its public URL written to candidates.resume_url (only when the candidate has no resume yet).',
+			},
+			{
+				displayName: 'Education Completed',
+				name: 'education_completed',
+				type: 'boolean',
+				default: false,
+				description:
+					'Whether the candidate has a completed vocational education. When true, sets education_status to "completed" (only if currently empty); when false, the column is left untouched.',
+			},
+		],
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
@@ -234,6 +268,7 @@ export class CandidateIntake implements INodeType {
 			for (const f of INPUT_FIELDS) {
 				input[f.name] = this.getNodeParameter(f.name, i, '') as string;
 			}
+			input.education_completed = this.getNodeParameter('education_completed', i, false) as boolean;
 
 			try {
 				const name = composeName(input.firstname, input.lastname);
@@ -313,6 +348,52 @@ export class CandidateIntake implements INodeType {
 					}
 				}
 
+				// 5. Resume capture — independent of posting-group attribution.
+				// Failures here never drop the candidate: they are recorded in the
+				// per-item summary instead of thrown, regardless of continueOnFail.
+				let resumeUploaded = false;
+				let resumeUrl: string | null = null;
+				let resumeError: string | null = null;
+				const resumeSourceUrl = this.getNodeParameter('resume_source_url', i, '') as string;
+				const existingResumeUrl = duplicate ? duplicate.resume_url : null;
+				if (shouldUploadResume(resumeSourceUrl, existingResumeUrl)) {
+					try {
+						const response = (await this.helpers.httpRequest({
+							method: 'GET',
+							url: resumeSourceUrl,
+							encoding: 'arraybuffer',
+							returnFullResponse: true,
+						})) as { body: unknown; headers?: Record<string, unknown> };
+						const headers = response.headers ?? {};
+						const buffer = Buffer.isBuffer(response.body)
+							? response.body
+							: Buffer.from(response.body as ArrayBuffer);
+
+						// Size guard: reject on the declared Content-Length OR the
+						// actual downloaded buffer, whichever trips the ~15 MB cap.
+						const declared = Number(headers['content-length']);
+						const declaredSize = Number.isFinite(declared) ? declared : 0;
+						if (isResumeTooLarge(declaredSize) || isResumeTooLarge(buffer.length)) {
+							throw new Error(`resume exceeds ${MAX_RESUME_BYTES}-byte limit`);
+						}
+
+						const contentType =
+							typeof headers['content-type'] === 'string'
+								? (headers['content-type'] as string)
+								: null;
+						const fileType = detectResumeType(contentType, resumeSourceUrl);
+						const objectPath = resumeObjectPath(candidateId, fileType.ext);
+						await uploadToStorage(this, host, RESUME_BUCKET, objectPath, buffer, fileType.contentType);
+						resumeUrl = resumePublicUrl(host, candidateId, fileType.ext);
+						await patchCandidate(this, host, candidateId, { resume_url: resumeUrl });
+						resumeUploaded = true;
+					} catch (error) {
+						resumeError = (error as Error).message;
+						resumeUrl = null;
+						resumeUploaded = false;
+					}
+				}
+
 				const summary: OutputSummary = {
 					candidate_id: candidateId,
 					candidate_created: candidateCreated,
@@ -322,6 +403,9 @@ export class CandidateIntake implements INodeType {
 					submission_created: submissionCreated,
 					job_title_id: resolution.jobTitleId,
 					job_title_match_via: resolution.via,
+					resume_uploaded: resumeUploaded,
+					resume_url: resumeUrl,
+					resume_error: resumeError,
 				};
 				out.push({ json: summary as unknown as IDataObject, pairedItem: { item: i } });
 			} catch (error) {

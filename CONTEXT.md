@@ -39,6 +39,16 @@ required keys `candidate_id` + `posting_group_id` + `customer_id`. A
 the stage this intake creates.
 _Avoid_: Forwarding (that's a later stage), application.
 
+**Resume Source URL** (`resume_source_url`, node input):
+The external link the intake **downloads the resume file from** (e.g. a Perspective
+form upload link). Distinct from the stored `candidates.resume_url`.
+_Avoid_: calling the input "resume_url" — that name is reserved for the stored value.
+
+**Resume URL** (`candidates.resume_url`, stored):
+The canonical **Supabase Storage** link to the candidate's resume, in the public
+`resumes` bucket at path `<candidate_id>.<ext>`. This is what the node writes.
+_Avoid_: confusing it with the incoming Resume Source URL.
+
 ## Intake input contract
 
 The node receives one candidate per item. `source` is passed in directly as a
@@ -77,6 +87,29 @@ live submission for that `(candidate_id, posting_group_id)` pair exists yet.
 
 **No posting-group match** still creates/enriches the candidate (with job title
 resolved via funnel/meta/fuzzy); it simply produces no submission.
+
+**Resume upload.** When a `resume_source_url` is provided, the node (after the
+candidate is resolved) downloads the file with a plain unauthenticated GET,
+uploads it to the public `resumes` bucket at the deterministic path
+`<candidate_id>.<ext>` (`x-upsert`), and sets `candidates.resume_url` to the public
+URL. Behaviour:
+- Runs only when the candidate's `resume_url` is currently NULL/empty — follows the
+  same enrich-never-overwrite rule as every other field. A duplicate that already
+  has a resume is skipped entirely (no download).
+- Always a separate `PATCH` after INSERT/dedup (candidate id must exist first); ids
+  stay DB-generated.
+- Extension/Content-Type derived from the download's `Content-Type` header → URL
+  extension → `.pdf`/`application/pdf` fallback. No hard type allowlist.
+- Downloads over **~15 MB** are skipped (recorded as `resume_error`).
+- **Resume failures never drop the candidate.** Download/upload/patch errors are
+  swallowed into the output summary (`resume_uploaded`, `resume_url`,
+  `resume_error`), independent of `continueOnFail`.
+
+**Completed-education flag.** A boolean node input. `true` →
+`education_status = 'completed'`; `false` → leave the column untouched (NULL). Flows
+through the normal enrich path: only written when the existing `education_status` is
+NULL/empty, never overwriting an already-set status. The other enum values
+(`none`, `in_training`, `in_recognition`) are not reachable via this node.
 
 ## Field mapping & constants
 

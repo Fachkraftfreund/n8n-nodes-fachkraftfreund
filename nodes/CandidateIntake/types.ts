@@ -44,6 +44,8 @@ export interface IntakeInput {
 	perspective_funnel_id?: string;
 	source?: string;
 	job?: string;
+	/** Completed-education flag. `true` → education_status = 'completed'. */
+	education_completed?: boolean;
 }
 
 /** Subset of a `job_titles` row used for title resolution. */
@@ -120,4 +122,10 @@ export interface OutputSummary {
 	submission_created: boolean;
 	job_title_id: string | null;
 	job_title_match_via: JobTitleMatchVia;
+	/** Whether this run downloaded + uploaded a resume to the resumes bucket. */
+	resume_uploaded: boolean;
+	/** Public Storage URL written to candidates.resume_url, or null if none was uploaded. */
+	resume_url: string | null;
+	/** Reason the resume step skipped/failed (oversized, dead link, upload error), or null. */
+	resume_error: string | null;
 }
