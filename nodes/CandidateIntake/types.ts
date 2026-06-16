@@ -60,10 +60,11 @@ export interface JobTitleRecord {
 	nationwide_meta_campaign_id: string[] | null;
 }
 
-/** A live `job_title_aliases` row: free-text variant → canonical title. */
+/** A live `job_title_aliases` row: free-text variant → canonical title name.
+ *  `canonical_name` is resolved to a `job_titles.id` by matching `job_titles.name`. */
 export interface JobTitleAlias {
 	alias_lower: string;
-	job_title_id: string;
+	canonical_name: string;
 }
 
 /** Subset of a `posting_groups` row used for attribution. */

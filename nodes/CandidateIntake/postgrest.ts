@@ -54,7 +54,7 @@ export async function fetchJobTitleAliases(
 	return pgRequest<JobTitleAlias[]>(ctx, {
 		method: 'GET',
 		url: restUrl(host, 'job_title_aliases'),
-		qs: { select: 'alias_lower,job_title_id' },
+		qs: { select: 'alias_lower,canonical_name', deleted_at: 'is.null' },
 	});
 }
 

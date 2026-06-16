@@ -49,8 +49,16 @@ export function resolveJobTitle(input: {
 		for (const alias of aliases) {
 			const score = trigramSimilarity(clean, alias.alias_lower);
 			if (score > bestScore) {
-				bestScore = score;
-				bestId = alias.job_title_id;
+				// Resolve the alias's canonical name to a title id. An alias whose
+				// canonical_name matches no live title is unusable — skip it so a
+				// lower-scoring but resolvable match can still win.
+				const match = titles.find(
+					(t) => t.name.toLowerCase() === alias.canonical_name.toLowerCase(),
+				);
+				if (match) {
+					bestScore = score;
+					bestId = match.id;
+				}
 			}
 		}
 		for (const t of titles) {
