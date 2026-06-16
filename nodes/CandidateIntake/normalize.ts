@@ -78,11 +78,43 @@ export function identityFrom(fields: {
 	};
 }
 
+// Lowercase nobiliary/connective particles kept lowercase in German/Dutch/
+// Romance names (e.g. "Max von der Berg"). Only honoured when not the leading
+// word — a name that starts with the particle still gets capitalized.
+const NAME_PARTICLES = new Set([
+	'von', 'van', 'de', 'del', 'der', 'den', 'di', 'da', 'le', 'la', 'du',
+	'zu', 'zur', 'zum', 'ten', 'ter', 'und',
+]);
+
+/** Capitalize a single word, treating hyphen and apostrophe as segment breaks. */
+function capitalizeWord(word: string): string {
+	return word
+		.split('-')
+		.map((part) =>
+			part
+				.split("'")
+				.map((seg) => (seg ? seg[0].toUpperCase() + seg.slice(1).toLowerCase() : seg))
+				.join("'"),
+		)
+		.join('-');
+}
+
+/** Title-case a full name, leaving known particles lowercase unless leading. */
+function toTitleCaseName(name: string): string {
+	return name
+		.split(' ')
+		.map((word, i) =>
+			i > 0 && NAME_PARTICLES.has(word.toLowerCase()) ? word.toLowerCase() : capitalizeWord(word),
+		)
+		.join(' ');
+}
+
 export function composeName(
 	firstname: string | undefined | null,
 	lastname: string | undefined | null,
 ): string {
-	return `${firstname ?? ''} ${lastname ?? ''}`.replace(/\s+/g, ' ').trim();
+	const joined = `${firstname ?? ''} ${lastname ?? ''}`.replace(/\s+/g, ' ').trim();
+	return toTitleCaseName(joined);
 }
 
 export function normalizeNameForDedup(name: string | undefined | null): string | null {
