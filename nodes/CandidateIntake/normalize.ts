@@ -1,4 +1,4 @@
-import { NormalizedIdentity } from './types';
+import { CleanedName, NormalizedIdentity } from './types';
 
 export function toE164(phone: string | undefined | null): string | null {
 	if (!phone) return null;
@@ -99,12 +99,19 @@ function capitalizeWord(word: string): string {
 		.join('-');
 }
 
-/** Title-case a full name, leaving known particles lowercase unless leading. */
-function toTitleCaseName(name: string): string {
+/**
+ * Title-case a full name, leaving known particles lowercase unless they lead.
+ * `leading` says whether this string starts the full display name: when false
+ * (e.g. a standalone last-name part that follows a first name), even a particle
+ * in word 0 stays lowercase, so `name` and `last_name` agree on casing.
+ */
+function toTitleCaseName(name: string, leading = true): string {
 	return name
 		.split(' ')
 		.map((word, i) =>
-			i > 0 && NAME_PARTICLES.has(word.toLowerCase()) ? word.toLowerCase() : capitalizeWord(word),
+			(i > 0 || !leading) && NAME_PARTICLES.has(word.toLowerCase())
+				? word.toLowerCase()
+				: capitalizeWord(word),
 		)
 		.join(' ');
 }
@@ -115,6 +122,94 @@ export function composeName(
 ): string {
 	const joined = `${firstname ?? ''} ${lastname ?? ''}`.replace(/\s+/g, ' ').trim();
 	return toTitleCaseName(joined);
+}
+
+/**
+ * Repair a letter-spaced name field. A field whose whitespace-split tokens are
+ * *all* single characters is treated as letter-spacing and collapsed into
+ * words, where a run of **2+ spaces** marks a word boundary
+ * (`M A X` → `MAX`, `A N N A  L E N A` → `ANNA LENA`). A field containing any
+ * multi-letter token is returned unchanged, so a genuine short name (`Jo`) is
+ * never mangled. Casing is left to the title-case step.
+ */
+export function deSpaceLetters(field: string): string {
+	const trimmed = field.trim();
+	if (trimmed === '') return field;
+	const tokens = trimmed.split(/\s+/);
+	if (!tokens.every((t) => t.length === 1)) return field;
+	return trimmed
+		.split(/\s{2,}/)
+		.map((word) => word.replace(/\s+/g, ''))
+		.join(' ');
+}
+
+/**
+ * Lift a leading academic title out of a name field. A leading `Dr`/`Prof`
+ * token (any case, optional trailing dot) followed by an actual name is removed
+ * and returned normalized to `dr`/`prof`. Only these two are recognized; any
+ * other leading token — or a bare `Dr` with no name after it — is left intact.
+ */
+export function extractAcademicTitle(field: string): { title: string | null; rest: string } {
+	const m = field.trim().match(/^(dr|prof)\.?\s+(\S.*)$/i);
+	if (!m) return { title: null, rest: field };
+	return { title: m[1].toLowerCase(), rest: m[2].trim() };
+}
+
+/**
+ * Clean one incoming name part (first or last) in isolation: de-space letter-
+ * spacing, title-case (particles stay lowercase per `leading`), then lift a
+ * leading `Dr`/`Prof` into a normalized title. `leading` is false for a last
+ * name so its particles agree with how they read in the composed full name.
+ */
+export function cleanNamePart(
+	field: string | undefined | null,
+	options: { leading?: boolean } = {},
+): { cleaned: string; title: string | null } {
+	const { leading = true } = options;
+	const deSpaced = deSpaceLetters(field ?? '');
+	const collapsed = deSpaced.replace(/\s+/g, ' ').trim();
+	const cased = toTitleCaseName(collapsed, leading);
+	const { title, rest } = extractAcademicTitle(cased);
+	return { cleaned: rest.trim(), title };
+}
+
+/**
+ * Clean both intake name parts and compose the candidate name. Each part is
+ * cleaned independently (the last name as a non-leading segment so its
+ * particles stay lowercase); `name` is the join of the cleaned parts and
+ * therefore always equals `firstName + " " + lastName`. The academic title is
+ * taken from whichever part carried it, first name winning a tie.
+ */
+export function cleanName(
+	firstname: string | undefined | null,
+	lastname: string | undefined | null,
+): CleanedName {
+	const first = cleanNamePart(firstname, { leading: true });
+	const last = cleanNamePart(lastname, { leading: false });
+	const name = [first.cleaned, last.cleaned].filter((p) => p !== '').join(' ');
+	return {
+		name,
+		firstName: first.cleaned,
+		lastName: last.cleaned,
+		title: first.title ?? last.title,
+	};
+}
+
+/**
+ * Decide a candidate's gender by majority vote over known `male`/`female`
+ * values. Anything that is not exactly `male`/`female` (e.g. `unknown`) is
+ * ignored. A tie or the absence of any `male`/`female` vote yields null.
+ */
+export function genderMajority(genders: string[]): 'male' | 'female' | null {
+	let male = 0;
+	let female = 0;
+	for (const g of genders) {
+		if (g === 'male') male++;
+		else if (g === 'female') female++;
+	}
+	if (male > female) return 'male';
+	if (female > male) return 'female';
+	return null;
 }
 
 export function normalizeNameForDedup(name: string | undefined | null): string | null {

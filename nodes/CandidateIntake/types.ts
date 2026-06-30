@@ -48,6 +48,19 @@ export interface IntakeInput {
 	education_completed?: boolean;
 }
 
+/**
+ * The cleaned candidate name, composed from the two intake parts. `name` is the
+ * full display name; `firstName`/`lastName` are the cleaned parts (kept casing-
+ * consistent with `name`); `title` is the academic title (`dr`/`prof`) lifted
+ * off whichever part carried it, or null.
+ */
+export interface CleanedName {
+	name: string;
+	firstName: string;
+	lastName: string;
+	title: string | null;
+}
+
 /** Subset of a `job_titles` row used for title resolution. */
 export interface JobTitleRecord {
 	id: string;

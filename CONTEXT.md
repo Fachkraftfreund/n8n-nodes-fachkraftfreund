@@ -8,10 +8,21 @@ external services and the `cloud` Supabase project (recruiting CRM / ATS).
 ### Recruiting domain (the `cloud` Supabase project)
 
 **Candidate**:
-A job seeker. One row in `candidates`. `name` is a single column (no separate
-first/last). `source` is the acquisition channel (enum: `meta_ads`, `indeed`,
-`stepstone`, `xing`, `website`, `empfehlung`, `indeed_extension`).
+A job seeker. One row in `candidates`. `name` is the full display name; it is
+mirrored by separate `first_name` / `last_name` columns (all title-cased and kept
+consistent). `gender` is free text (`female` / `male` / `unknown`), inferred — not
+collected on the form. `title` is an academic title (`dr` / `prof`, lowercased, no
+dot), parsed off the name. `source` is the acquisition channel (enum: `meta_ads`,
+`indeed`, `stepstone`, `xing`, `website`, `empfehlung`, `indeed_extension`).
 _Avoid_: Applicant, lead, Bewerber.
+
+**Gender (self-lookup inference)**:
+The intake has no gender input. Gender is inferred by matching the incoming
+`first_name` (case-insensitively) against existing `candidates` rows and taking the
+**majority of their `male`/`female`** values (`unknown` rows ignored). A tie, or no
+`male`/`female` match, leaves gender NULL. Reuses our own labelled candidate base as
+the name→gender dataset — no external API.
+_Avoid_: treating `unknown` as a vote; calling a gender API.
 
 **Job Title**:
 A canonical occupation. One row in `job_titles` (e.g. "Pflegefachkraft"). Carries
@@ -111,9 +122,27 @@ through the normal enrich path: only written when the existing `education_status
 NULL/empty, never overwriting an already-set status. The other enum values
 (`none`, `in_training`, `in_recognition`) are not reachable via this node.
 
+## Name cleaning (applied per field before composing `name`)
+
+Each of `firstname` / `lastname` is cleaned independently:
+1. **De-space letters.** A field that is *all* single-character tokens is treated as
+   letter-spaced and collapsed into words; a run of **2+ spaces** marks a word
+   boundary (`M A X` → `Max`, `A N N A  L E N A` → `Anna Lena`). A field with normal
+   multi-letter words is left as-is (a real 2-letter name like `Jo` is untouched).
+2. **Normalize case.** Lowercase, then title-case with the existing particle/hyphen
+   rules (`MAX` / `max` → `Max`, `von` stays lowercased when not leading).
+3. **Extract academic title.** A leading `Dr`/`Prof` (any case, optional dot) is
+   moved to `title` (normalized `dr`/`prof`) and stripped from the name. Only these
+   two are recognized; other prefixes stay in the name.
+
+`name` = cleaned `"{firstname} {lastname}"`; `first_name` / `last_name` store the
+cleaned parts, so all three agree.
+
 ## Field mapping & constants
 
-- `name` = `"{firstname} {lastname}"` (trimmed). `import_source = 'perspective'`.
+- `name` = cleaned `"{firstname} {lastname}"` (see Name cleaning).
+  `first_name` / `last_name` = the cleaned parts. `title` = parsed `dr`/`prof` or
+  NULL. `gender` = self-lookup majority (see Gender). `import_source = 'perspective'`.
   `source` from input (enum), default `meta_ads`. `status` default `new`.
 - email stored lowercased+trimmed; phone stored normalized to E.164 (`+49…`).
 - `pay → desired_salary`, `experience → work_experience`,

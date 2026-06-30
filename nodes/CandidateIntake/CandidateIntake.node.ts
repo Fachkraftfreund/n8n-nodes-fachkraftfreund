@@ -8,7 +8,8 @@ import {
 } from 'n8n-workflow';
 
 import {
-	composeName,
+	cleanName,
+	genderMajority,
 	identityFrom,
 	normalizeEmailForStorage,
 	normalizePhoneForDedup,
@@ -18,6 +19,7 @@ import { findDuplicate } from './dedup';
 import { resolveJobTitle } from './resolveJobTitle';
 import {
 	fetchCandidatePrefilter,
+	fetchGenderVotes,
 	fetchJobTitleAliases,
 	fetchJobTitles,
 	fetchLiveSubmissions,
@@ -40,6 +42,7 @@ import {
 	DEFAULT_SOURCE,
 	IMPORT_SOURCE,
 	type CandidateRow,
+	type CleanedName,
 	type IntakeInput,
 	type JobTitleResolution,
 	type NormalizedIdentity,
@@ -157,11 +160,15 @@ export function buildOrClause(input: IntakeInput, name: string): string | null {
 /** The mapped candidate data columns (excludes provenance constants). */
 export function mappedFields(
 	input: IntakeInput,
-	name: string,
+	cleaned: CleanedName,
 	resolution: JobTitleResolution,
 ): IDataObject {
 	return {
-		name,
+		name: cleaned.name,
+		first_name: cleaned.firstName || null,
+		last_name: cleaned.lastName || null,
+		// Academic title parsed off the name (`dr`/`prof`), or null when absent.
+		title: cleaned.title,
 		email: normalizeEmailForStorage(input.email),
 		phone: toE164(input.phone),
 		city: trimToNull(input.city),
@@ -183,11 +190,11 @@ export function mappedFields(
 /** Full insert payload for a brand-new candidate. */
 export function buildInsertPayload(
 	input: IntakeInput,
-	name: string,
+	cleaned: CleanedName,
 	resolution: JobTitleResolution,
 	appliedAt: string,
 ): IDataObject {
-	const mapped = mappedFields(input, name, resolution);
+	const mapped = mappedFields(input, cleaned, resolution);
 	const payload: IDataObject = {};
 	for (const [key, value] of Object.entries(mapped)) {
 		if (!isEmptyValue(value)) payload[key] = value;
@@ -201,11 +208,11 @@ export function buildInsertPayload(
 /** Enrichment payload: incoming values only for columns currently NULL/empty. */
 export function buildEnrichPayload(
 	input: IntakeInput,
-	name: string,
+	cleaned: CleanedName,
 	resolution: JobTitleResolution,
 	existing: CandidateRow,
 ): IDataObject {
-	const mapped = mappedFields(input, name, resolution);
+	const mapped = mappedFields(input, cleaned, resolution);
 	const payload: IDataObject = {};
 	for (const [key, value] of Object.entries(mapped)) {
 		if (!isEmptyValue(value) && isEmptyValue(existing[key])) {
@@ -213,6 +220,22 @@ export function buildEnrichPayload(
 		}
 	}
 	return payload;
+}
+
+/**
+ * Resolve a candidate's gender by self-lookup: fetch the `male`/`female` votes
+ * of same-first-name candidates and take the majority. Returns null (and issues
+ * no query) when there's no first name to match on, so the caller can skip the
+ * read whenever gender would not be written anyway.
+ */
+async function lookupGender(
+	ctx: IExecuteFunctions,
+	host: string,
+	firstName: string,
+): Promise<'male' | 'female' | null> {
+	const f = trimToNull(firstName);
+	if (f === null) return null;
+	return genderMajority(await fetchGenderVotes(ctx, host, f));
 }
 
 // ─── Node ─────────────────────────────────────────────────────────────────────
@@ -271,7 +294,8 @@ export class CandidateIntake implements INodeType {
 			input.education_completed = this.getNodeParameter('education_completed', i, false) as boolean;
 
 			try {
-				const name = composeName(input.firstname, input.lastname);
+				const cleaned = cleanName(input.firstname, input.lastname);
+				const name = cleaned.name;
 				if (name === '') {
 					throw new NodeOperationError(
 						this.getNode(),
@@ -319,12 +343,21 @@ export class CandidateIntake implements INodeType {
 				if (duplicate) {
 					candidateId = duplicate.id;
 					candidateCreated = false;
-					const enrich = buildEnrichPayload(input, name, resolution, duplicate);
+					const enrich = buildEnrichPayload(input, cleaned, resolution, duplicate);
+					// Gender rides the same enrich-never-overwrite rule, but lives
+					// outside the pure mapper because it needs a DB read. Skip the
+					// lookup entirely when the existing gender is already set.
+					if (isEmptyValue(duplicate.gender)) {
+						const gender = await lookupGender(this, host, cleaned.firstName);
+						if (gender !== null) enrich.gender = gender;
+					}
 					if (Object.keys(enrich).length > 0) {
 						await patchCandidate(this, host, candidateId, enrich);
 					}
 				} else {
-					const payload = buildInsertPayload(input, name, resolution, new Date().toISOString());
+					const payload = buildInsertPayload(input, cleaned, resolution, new Date().toISOString());
+					const gender = await lookupGender(this, host, cleaned.firstName);
+					if (gender !== null) payload.gender = gender;
 					const created = await insertCandidate(this, host, payload);
 					candidateId = created.id;
 					candidateCreated = true;

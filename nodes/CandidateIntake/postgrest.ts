@@ -92,6 +92,29 @@ export async function fetchCandidatePrefilter(
 	});
 }
 
+/**
+ * Gender self-lookup votes: the `gender` of live candidates whose `first_name`
+ * matches `firstName` case-insensitively, restricted to `male`/`female`
+ * (soft-deleted excluded). The majority is tallied in TypeScript by the caller.
+ */
+export async function fetchGenderVotes(
+	ctx: IExecuteFunctions,
+	host: string,
+	firstName: string,
+): Promise<string[]> {
+	const rows = await pgRequest<{ gender: string | null }[]>(ctx, {
+		method: 'GET',
+		url: restUrl(host, 'candidates'),
+		qs: {
+			select: 'gender',
+			deleted_at: 'is.null',
+			first_name: `ilike.${firstName}`,
+			gender: 'in.(male,female)',
+		},
+	});
+	return rows.map((r) => r.gender).filter((g): g is string => g != null);
+}
+
 export async function insertCandidate(
 	ctx: IExecuteFunctions,
 	host: string,
